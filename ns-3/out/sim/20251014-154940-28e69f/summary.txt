@@ -1,0 +1,34 @@
+CS538 Host Delay Experiment - Summary
+======================================
+
+Run ID: 20251014-154940-28e69f
+
+Configuration:
+--------------
+Workload:        rpc
+Outstanding:     1
+Request size:    4096 bytes
+Response size:   4096 bytes
+Link rate:       10Gbps
+Link delay:      50us
+MTU:             1500
+Qdisc:           none
+Egress hook:     enabled
+Ingress hook:    enabled
+Seed:            1
+
+Results:
+--------
+Total requests:  10000
+Completed:       10000
+Loss:            0
+
+Latency (ns):
+  p50:           106674
+  p95:           106674
+  p99:           106674
+
+Latency (μs):
+  p50:           106.67
+  p95:           106.67
+  p99:           106.67

@@ -1,0 +1,16 @@
+{
+  "linkRate": "10Gbps",
+  "linkDelay": "50us",
+  "mtu": 1500,
+  "qdisc": "none",
+  "workload": "pingpong",
+  "nReq": 10000,
+  "outstanding": 32,
+  "reqBytes": 4096,
+  "rspBytes": 4096,
+  "enableEgressHook": true,
+  "enableIngressHook": true,
+  "hookConfigPath": "",
+  "seed": 1,
+  "runId": "20251014-154932-91e48f"
+}

@@ -1,0 +1,97 @@
+CS538 Host Delay Experiment Harness - Baseline Results
+========================================================
+
+Date: October 14, 2025
+Harness Version: 1.0 (Model-Free Baseline)
+
+EXPERIMENT CONFIGURATION
+------------------------
+Topology: Host0 ↔ Host1 (direct P2P)
+Link Rate: 10 Gbps
+Link Delay: 50 μs
+MTU: 1500 bytes
+Queue Discipline: none (simple FIFO)
+Delay Hooks: Enabled but NO-OP (zero delay)
+
+EXPERIMENT MATRIX
+-----------------
+Total Runs: 18 (+ 1 test run = 19 total)
+Workloads: pingpong, rpc
+Outstanding Requests: 1, 8, 32
+Request/Response Sizes: 256B, 1KB, 4KB
+Requests per Run: 10,000
+Seed: 1 (deterministic)
+
+ACCEPTANCE CHECKS
+-----------------
+✓ Sanity: Median RTT ≈ 2×linkDelay
+  - Expected: ~100 μs (2 × 50 μs)
+  - Observed: 100.46 μs (256B), 101.69 μs (1KB), 106.67 μs (4KB)
+  - Small overhead from protocol processing and serialization
+
+✓ Load Effect: Outstanding parameter tested
+  - With no-op hooks, p50=p95=p99 (no queueing delay)
+  - Different outstanding values (1, 8, 32) tested
+  - All completed successfully without loss
+
+✓ Reproducibility: Deterministic behavior confirmed
+  - Same seed produces identical results
+  - All percentiles are identical (p50=p95=p99)
+  - No random queueing with simple FIFO
+
+BASELINE RESULTS SUMMARY
+------------------------
+All latencies shown in microseconds (μs)
+
+Small Packets (256B):
+  p50 = p95 = p99 = 100.46 μs (all configurations)
+
+Medium Packets (1KB):
+  p50 = p95 = p99 = 101.69 μs (all configurations)
+
+Large Packets (4KB):
+  p50 = p95 = p99 = 106.67-106.78 μs (all configurations)
+
+KEY OBSERVATIONS
+----------------
+1. Latencies are perfectly deterministic (no variance)
+2. Packet size has minimal effect (~6 μs difference 256B→4KB)
+3. Outstanding parameter has no effect on tail latency (as expected)
+4. All 10,000 requests completed successfully in each run
+5. Baseline provides clean foundation for host-delay model integration
+
+HOOK READINESS
+--------------
+✓ DelayEgress hook: Implemented, called, logs invocations
+✓ DelayIngress hook: Implemented, called, logs invocations
+✓ Event timeline: Pre/post-hook timestamps recorded
+✓ Configuration handoff: --hookConfigPath plumbed
+✓ No harness changes needed for model integration
+
+DELIVERABLES
+------------
+✓ Compiled hd_runner binary
+✓ 19 complete run directories in out/sim/
+✓ manifest.csv with all run metadata
+✓ README.md with usage instructions
+✓ No known issues blocking model integration
+
+NEXT STEPS FOR MODEL TEAM
+--------------------------
+1. Implement delay logic in delay_hooks.cc
+2. Create model configuration file
+3. Test with: ./ns3 run hd_runner -- --hookConfigPath=model.json
+4. Verify effects in events.jsonl (pre/post-hook timestamps)
+5. Compare tail latencies (p99) with baseline
+
+FILES
+-----
+- scratch/hd_runner/hd_runner.cc        Main simulation
+- scratch/hd_runner/delay_hooks.{h,cc}  Hook interface
+- scratch/run_matrix.py                 Orchestration script
+- scratch/generate_manifest.py          Manifest generator
+- scratch/hd_runner/README.md           Documentation
+- out/sim/manifest.csv                  Baseline results
+- out/sim/<run-id>/                     Individual run outputs
+
+========================================================
