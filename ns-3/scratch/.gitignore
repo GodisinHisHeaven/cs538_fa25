@@ -6,3 +6,8 @@
 !subdir/
 !scratch-simulator.cc
 !CMakeLists.txt
+
+# CS538 experiment harness
+!hd_runner/
+!run_matrix.py
+!generate_manifest.py
