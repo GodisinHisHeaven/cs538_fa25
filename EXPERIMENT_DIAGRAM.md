@@ -5,14 +5,14 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Deterministic Network Path                   │
-│                                                                  │
-│   ┌──────────┐      Point-to-Point Link       ┌──────────┐     │
+│                                                                 │
+│   ┌──────────┐      Point-to-Point Link        ┌──────────┐     │
 │   │          │  ────────────────────────────►  │          │     │
 │   │  Host 0  │                                 │  Host 1  │     │
 │   │ (Client) │  ◄────────────────────────────  │ (Server) │     │
 │   │          │                                 │          │     │
 │   └──────────┘                                 └──────────┘     │
-│                                                                  │
+│                                                                 │
 │   Link Rate:  10 Gbps                                           │
 │   Link Delay: 50 μs (one-way)                                   │
 │   MTU:        1500 bytes                                        │
@@ -24,7 +24,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              REQUEST PATH                                │
+│                              REQUEST PATH                               │
 └─────────────────────────────────────────────────────────────────────────┘
 
 Host 0 (Client)                                        Host 1 (Server)
@@ -35,43 +35,43 @@ Host 0 (Client)                                        Host 1 (Server)
 │              │                                       │              │
 └──────┬───────┘                                       └──────▲───────┘
        │                                                      │
-       │ 1. Send Request                                     │
-       │    (t_send_ns)                                      │
+       │ 1. Send Request                                      │
+       │    (t_send_ns)                                       │
        ▼                                                      │
-┌──────────────┐                                             │
-│ DelayEgress  │ ◄─── Hook called before NIC Tx             │
-│   (NO-OP)    │      Returns: 0 delay                       │
-└──────┬───────┘                                             │
+┌──────────────┐                                              │
+│ DelayEgress  │ ◄─── Hook called before NIC Tx               │
+│   (NO-OP)    │      Returns: 0 delay                        │
+└──────┬───────┘                                              │
        │                                                      │
-       │ 2. Egress Hook Applied                              │
-       │    (currently no delay)                             │
+       │ 2. Egress Hook Applied                               │
+       │    (currently no delay)                              │
        ▼                                                      │
-┌──────────────┐                                             │
-│  NIC Tx (L2) │ ─────────────────────────────┐             │
-└──────────────┘                               │             │
-                                               │             │
-                           3. Network Transit  │             │
-                              (~100 μs RTT)    │             │
-                                               │             │
-                                               ▼             │
-                                        ┌──────────────┐     │
-                                        │  NIC Rx (L2) │     │
-                                        └──────┬───────┘     │
-                                               │             │
-                                               │ 4. Receive  │
-                                               ▼             │
-                                        ┌──────────────┐     │
-                                        │DelayIngress  │     │
+┌──────────────┐                                              │
+│  NIC Tx (L2) │ -─────────────────────────────┐              │
+└──────────────┘                               │              │
+                                               │              │
+                           3. Network Transit  │              │
+                              (~100 μs RTT)    │              │
+                                               │              │
+                                               ▼              │
+                                        ┌──────────────┐      │
+                                        │  NIC Rx (L2) │      │
+                                        └──────┬───────┘      │
+                                               │              │
+                                               │ 4. Receive   │
+                                               ▼              │
+                                        ┌──────────────┐      │
+                                        │DelayIngress  │      │
                                         │   (NO-OP)    │ ◄── Hook before app
-                                        └──────┬───────┘     │
-                                               │             │
-                                               │ 5. Ingress  │
-                                               │    Applied  │
-                                               └─────────────┘
+                                        └──────┬───────┘      │
+                                               │              │
+                                               │ 5. Ingress   │
+                                               │    Applied   │
+                                               └─────────────-┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                             RESPONSE PATH                                │
-│                          (Same hooks apply)                              │
+│                             RESPONSE PATH                               │
+│                          (Same hooks apply)                             │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,32 +82,32 @@ Host 0 (Client)                                        Host 1 (Server)
 │                         hd_runner (Main)                          │
 ├───────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  ┌─────────────────┐              ┌──────────────────┐          │
-│  │  Configuration  │              │   Delay Hooks     │          │
-│  │   - CLI Parser  │              │  - DelayEgress()  │          │
-│  │   - Run Config  │              │  - DelayIngress() │          │
-│  │   - Seed Mgmt   │              │  - NO-OP (now)    │          │
-│  └─────────────────┘              └──────────────────┘          │
+│  ┌─────────────────┐              ┌──────────────────┐            │
+│  │  Configuration   │              │   Delay Hooks    │            │
+│  │   - CLI Parser  │              │  - DelayEgress() │            │
+│  │   - Run Config   │              │  - DelayIngress()│            │
+│  │   - Seed Mgmt   │              │  - NO-OP (now)   │            │
+│  └─────────────────┘              └──────────────────┘            │
 │                                                                   │
-│  ┌──────────────────────────────────────────────────────┐       │
-│  │              Application Layer                        │       │
-│  │  ┌──────────────┐         ┌───────────────┐         │       │
-│  │  │ RpcClientApp │         │ RpcServerApp  │         │       │
-│  │  │              │         │               │         │       │
-│  │  │ - SendReq()  │         │ - HandleReq() │         │       │
-│  │  │ - HandleRsp()│         │ - SendRsp()   │         │       │
-│  │  │ - Track RTT  │         │               │         │       │
-│  │  └──────────────┘         └───────────────┘         │       │
-│  └──────────────────────────────────────────────────────┘       │
+│  ┌──────────────────────────────────────────────────────┐         │
+│  │              Application Layer                       │         │
+│  │  ┌──────────────┐         ┌───────────────┐          │         │
+│  │  │ RpcClientApp │         │ RpcServerApp  │          │         │
+│  │  │              │         │               │          │         │
+│  │  │ - SendReq()  │         │ - HandleReq() │          │         │
+│  │  │ - HandleRsp()│         │ - SendRsp()   │          │         │
+│  │  │ - Track RTT  │         │               │          │         │
+│  │  └──────────────┘         └───────────────┘          │         │
+│  └──────────────────────────────────────────────────────┘         │
 │                                                                   │
-│  ┌──────────────────────────────────────────────────────┐       │
-│  │           Instrumentation & Logging                   │       │
-│  │  - LogRpcRecord()      → rpc.jsonl                   │       │
-│  │  - LogEvent()          → events.jsonl                │       │
-│  │  - WriteConfig()       → config.json                 │       │
-│  │  - WriteSummary()      → summary.txt                 │       │
-│  │  - Percentile Calc     → p50/p95/p99                 │       │
-│  └──────────────────────────────────────────────────────┘       │
+│  ┌──────────────────────────────────────────────────────┐         │
+│  │           Instrumentation & Logging                  │         │
+│  │  - LogRpcRecord()      → rpc.jsonl                   │         │
+│  │  - LogEvent()          → events.jsonl                │         │
+│  │  - WriteConfig()       → config.json                   │         │
+│  │  - WriteSummary()      → summary.txt                 │         │
+│  │  - Percentile Calc     → p50/p95/p99                 │         │
+│  └──────────────────────────────────────────────────────┘         │
 │                                                                   │
 └───────────────────────────────────────────────────────────────────┘
 ```
@@ -116,7 +116,7 @@ Host 0 (Client)                                        Host 1 (Server)
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                    Experiment Orchestration                     │
+│                    Experiment Orchestration                    │
 └────────────────────────────────────────────────────────────────┘
 
   ┌──────────────────┐
@@ -153,7 +153,7 @@ Host 0 (Client)                                        Host 1 (Server)
            ▼
   ┌──────────────────────────────┐
   │  out/sim/<run-id>/           │
-  │  ├── config.json             │
+  │  ├── config.json              │
   │  ├── rpc.jsonl               │
   │  ├── events.jsonl            │
   │  └── summary.txt             │
@@ -173,7 +173,7 @@ Host 0 (Client)                                        Host 1 (Server)
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
-│                      Per-Request Tracking                      │
+│                      Per-Request Tracking                     │
 └───────────────────────────────────────────────────────────────┘
 
 Request Lifecycle:
@@ -214,8 +214,8 @@ events.jsonl:
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                      Baseline Results                           │
-│              (No-op hooks, zero host delay)                     │
+│                      Baseline Results                          │
+│              (No-op hooks, zero host delay)                    │
 └────────────────────────────────────────────────────────────────┘
 
 Packet Size vs Latency:
@@ -254,7 +254,7 @@ RTT ≈ 2 × Link Delay + Protocol Overhead
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│              Model Integration (Future Work)                    │
+│              Model Integration (Future Work)                   │
 └────────────────────────────────────────────────────────────────┘
 
 Current (NO-OP):                  Future (With Model):
@@ -291,7 +291,7 @@ Integration Process:
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│                    Output Metrics Summary                       │
+│                    Output Metrics Summary                      │
 └────────────────────────────────────────────────────────────────┘
 
 Per Run:
