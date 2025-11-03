@@ -4,6 +4,8 @@
 # Node configuration
 NODE0="c220g5-110929.wisc.cloudlab.us"
 NODE1="c220g5-110918.wisc.cloudlab.us"
+NODE0IP="10.10.1.1"
+NODE1IP="10.10.1.2"
 
 # SSH configuration
 SSH_KEY="~/.ssh/school"

@@ -21,7 +21,7 @@ run_ping() {
     local description=$2
     echo "Starting ping on node 1 ($description)..."
     ssh -i "$SSH_KEY" "${USER}@${NODE1}" \
-        "ping -i 0.1 ${NODE0} -c $((DURATION * 10))" \
+        "ping -i 0.1 ${NODE0IP} -c $((DURATION * 10))" \
         > "${output_file}" 2>&1 &
     PING_PID=$!
     echo "Ping started (PID: $PING_PID)"

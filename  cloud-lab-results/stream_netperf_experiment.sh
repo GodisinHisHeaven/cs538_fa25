@@ -47,7 +47,7 @@ run_netperf() {
     local description=$2
     echo "Starting netperf on node 1 ($description)..."
     ssh -i "$SSH_KEY" "${USER}@${NODE1}" \
-        "netperf -H ${NODE0} -l ${DURATION} -t TCP_STREAM -- -m 1024" \
+        "netperf -H ${NODE0IP} -l ${DURATION} -t TCP_STREAM -- -m 1024" \
         > "${output_file}" 2>&1 &
     NETPERF_PID=$!
     echo "Netperf started (PID: $NETPERF_PID)"
@@ -59,7 +59,7 @@ run_netperf_latency() {
     local description=$2
     echo "Starting netperf latency test on node 1 ($description)..."
     ssh -i "$SSH_KEY" "${USER}@${NODE1}" \
-        "netperf -H ${NODE0} -l ${DURATION} -t TCP_RR" \
+        "netperf -H ${NODE0IP} -l ${DURATION} -t TCP_RR" \
         > "${output_file}" 2>&1 &
     NETPERF_PID=$!
     echo "Netperf latency test started (PID: $NETPERF_PID)"
