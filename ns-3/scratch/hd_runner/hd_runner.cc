@@ -41,8 +41,10 @@ struct RunConfig
     // Network parameters
     std::string linkRate = "10Gbps";
     std::string linkDelay = "50us";
-    uint32_t mtu = 1500;
+    uint32_t mtu = 9000;  // 9K jumbo frames
     std::string qdisc = "none";  // none or fq_codel
+    std::string transport = "udp";  // udp or tcp
+    std::string tcpVariant = "TcpDctcp";  // TcpNewReno, TcpDctcp, etc.
 
     // Workload parameters
     std::string workload = "pingpong";  // pingpong or rpc
@@ -236,6 +238,8 @@ WriteConfigLog()
     ofs << "  \"linkDelay\": \"" << g_config.linkDelay << "\",\n";
     ofs << "  \"mtu\": " << g_config.mtu << ",\n";
     ofs << "  \"qdisc\": \"" << g_config.qdisc << "\",\n";
+    ofs << "  \"transport\": \"" << g_config.transport << "\",\n";
+    ofs << "  \"tcpVariant\": \"" << g_config.tcpVariant << "\",\n";
     ofs << "  \"workload\": \"" << g_config.workload << "\",\n";
     ofs << "  \"nReq\": " << g_config.nReq << ",\n";
     ofs << "  \"outstanding\": " << g_config.outstanding << ",\n";
@@ -290,6 +294,11 @@ WriteSummary()
     ofs << "Link delay:      " << g_config.linkDelay << "\n";
     ofs << "MTU:             " << g_config.mtu << "\n";
     ofs << "Qdisc:           " << g_config.qdisc << "\n";
+    ofs << "Transport:       " << g_config.transport << "\n";
+    if (g_config.transport == "tcp")
+    {
+        ofs << "TCP variant:     " << g_config.tcpVariant << "\n";
+    }
     ofs << "Egress hook:     " << (g_config.enableEgressHook ? "enabled" : "disabled") << "\n";
     ofs << "Ingress hook:    " << (g_config.enableIngressHook ? "enabled" : "disabled") << "\n";
     ofs << "Seed:            " << g_config.seed << "\n\n";
@@ -400,7 +409,17 @@ RpcClientApp::StartApplication()
 {
     if (!m_socket)
     {
-        TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
+        // Select socket factory based on transport type
+        TypeId tid;
+        if (g_config.transport == "tcp")
+        {
+            tid = TypeId::LookupByName("ns3::TcpSocketFactory");
+        }
+        else
+        {
+            tid = TypeId::LookupByName("ns3::UdpSocketFactory");
+        }
+
         m_socket = Socket::CreateSocket(GetNode(), tid);
 
         InetSocketAddress remote = InetSocketAddress(Ipv4Address::ConvertFrom(m_serverAddress), m_port);
@@ -533,8 +552,10 @@ private:
     virtual void StopApplication() override;
 
     void HandleRequest(Ptr<Socket> socket);
+    void HandleAccept(Ptr<Socket> socket, const Address& from);
 
     Ptr<Socket> m_socket;
+    std::vector<Ptr<Socket>> m_acceptedSockets;  // For TCP connections
     uint16_t m_port;
     uint32_t m_rspSize;
 };
@@ -563,11 +584,27 @@ RpcServerApp::StartApplication()
 {
     if (!m_socket)
     {
-        TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-        m_socket = Socket::CreateSocket(GetNode(), tid);
-        InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
-        m_socket->Bind(local);
-        m_socket->SetRecvCallback(MakeCallback(&RpcServerApp::HandleRequest, this));
+        // Select socket factory based on transport type
+        TypeId tid;
+        if (g_config.transport == "tcp")
+        {
+            tid = TypeId::LookupByName("ns3::TcpSocketFactory");
+            m_socket = Socket::CreateSocket(GetNode(), tid);
+            InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
+            m_socket->Bind(local);
+            m_socket->Listen();
+            m_socket->SetAcceptCallback(
+                MakeNullCallback<bool, Ptr<Socket>, const Address&>(),
+                MakeCallback(&RpcServerApp::HandleAccept, this));
+        }
+        else
+        {
+            tid = TypeId::LookupByName("ns3::UdpSocketFactory");
+            m_socket = Socket::CreateSocket(GetNode(), tid);
+            InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
+            m_socket->Bind(local);
+            m_socket->SetRecvCallback(MakeCallback(&RpcServerApp::HandleRequest, this));
+        }
     }
 }
 
@@ -579,19 +616,52 @@ RpcServerApp::StopApplication()
         m_socket->Close();
         m_socket->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
     }
+
+    // Close all accepted TCP sockets
+    for (auto& sock : m_acceptedSockets)
+    {
+        if (sock)
+        {
+            sock->Close();
+            sock->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
+        }
+    }
+    m_acceptedSockets.clear();
+}
+
+void
+RpcServerApp::HandleAccept(Ptr<Socket> socket, const Address& from)
+{
+    // Handle new TCP connection
+    socket->SetRecvCallback(MakeCallback(&RpcServerApp::HandleRequest, this));
+    m_acceptedSockets.push_back(socket);
 }
 
 void
 RpcServerApp::HandleRequest(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
-    Address from;
 
-    while ((packet = socket->RecvFrom(from)))
+    if (g_config.transport == "tcp")
     {
-        // Immediately send response
-        Ptr<Packet> response = Create<Packet>(m_rspSize);
-        socket->SendTo(response, 0, from);
+        // For TCP, use Recv() instead of RecvFrom()
+        while ((packet = socket->Recv()))
+        {
+            // Immediately send response
+            Ptr<Packet> response = Create<Packet>(m_rspSize);
+            socket->Send(response);
+        }
+    }
+    else
+    {
+        // For UDP, use RecvFrom()
+        Address from;
+        while ((packet = socket->RecvFrom(from)))
+        {
+            // Immediately send response
+            Ptr<Packet> response = Create<Packet>(m_rspSize);
+            socket->SendTo(response, 0, from);
+        }
     }
 }
 
@@ -607,10 +677,12 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     // Create 3 nodes: Host0, Switch, Host1
     NodeContainer allNodes;
     allNodes.Create(3);
+    Ptr<Node> host0 = allNodes.Get(0);
+    Ptr<Node> switchNode = allNodes.Get(1);
+    Ptr<Node> host1 = allNodes.Get(2);
 
-    hosts.Add(allNodes.Get(0));  // Host0
-    hosts.Add(allNodes.Get(2));  // Host1
-    // allNodes.Get(1) is the Switch
+    hosts.Add(host0);  // Host0
+    hosts.Add(host1);  // Host1
 
     // Configure point-to-point links
     PointToPointHelper p2p;
@@ -618,22 +690,62 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     p2p.SetChannelAttribute("Delay", StringValue(g_config.linkDelay));
     p2p.SetDeviceAttribute("Mtu", UintegerValue(g_config.mtu));
 
-    // For simplicity, we'll create a direct link between Host0 and Host1
-    // (In a real switch topology, we'd use a bridge, but for deterministic
-    // behavior, a direct link is cleaner)
-    NetDeviceContainer devices = p2p.Install(hosts);
+    // Create link: Host0 ↔ Switch
+    NodeContainer link0;
+    link0.Add(host0);
+    link0.Add(switchNode);
+    NetDeviceContainer devices0 = p2p.Install(link0);
 
-    // Install Internet stack
+    // Create link: Switch ↔ Host1
+    NodeContainer link1;
+    link1.Add(switchNode);
+    link1.Add(host1);
+    NetDeviceContainer devices1 = p2p.Install(link1);
+
+    // Install Internet stack on all nodes
     InternetStackHelper stack;
-    stack.Install(hosts);
+
+    // Configure TCP variant if using TCP
+    if (g_config.transport == "tcp")
+    {
+        Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue("ns3::" + g_config.tcpVariant));
+        // Enable ECN for DCTCP
+        if (g_config.tcpVariant == "TcpDctcp")
+        {
+            Config::SetDefault("ns3::TcpSocketBase::UseEcn", StringValue("On"));
+            Config::SetDefault("ns3::RedQueueDisc::UseEcn", BooleanValue(true));
+            Config::SetDefault("ns3::RedQueueDisc::UseHardDrop", BooleanValue(false));
+            Config::SetDefault("ns3::RedQueueDisc::MeanPktSize", UintegerValue(1500));
+            Config::SetDefault("ns3::RedQueueDisc::QW", DoubleValue(1.0));
+            Config::SetDefault("ns3::RedQueueDisc::MinTh", DoubleValue(20));
+            Config::SetDefault("ns3::RedQueueDisc::MaxTh", DoubleValue(60));
+        }
+    }
+
+    stack.Install(allNodes);
 
     // Assign IP addresses
     Ipv4AddressHelper address;
+
+    // Subnet for Host0 ↔ Switch
     address.SetBase("10.1.1.0", "255.255.255.0");
-    interfaces = address.Assign(devices);
+    Ipv4InterfaceContainer interfaces0 = address.Assign(devices0);
+
+    // Subnet for Switch ↔ Host1
+    address.SetBase("10.1.2.0", "255.255.255.0");
+    Ipv4InterfaceContainer interfaces1 = address.Assign(devices1);
+
+    // Enable global routing
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // Store host interfaces for application setup
+    // interfaces container will have Host0's address and Host1's address
+    interfaces.Add(interfaces0.Get(0));  // Host0: 10.1.1.1
+    interfaces.Add(interfaces1.Get(1));  // Host1: 10.1.2.2
 
     NS_LOG_INFO("Topology setup complete");
     NS_LOG_INFO("  Host0: " << interfaces.GetAddress(0));
+    NS_LOG_INFO("  Switch: 10.1.1.2 / 10.1.2.1");
     NS_LOG_INFO("  Host1: " << interfaces.GetAddress(1));
 }
 
@@ -652,6 +764,8 @@ main(int argc, char* argv[])
     cmd.AddValue("linkDelay", "Link propagation delay", g_config.linkDelay);
     cmd.AddValue("mtu", "MTU size", g_config.mtu);
     cmd.AddValue("qdisc", "Queue discipline (none|fq_codel)", g_config.qdisc);
+    cmd.AddValue("transport", "Transport protocol (udp|tcp)", g_config.transport);
+    cmd.AddValue("tcpVariant", "TCP variant (TcpNewReno|TcpDctcp|TcpCubic)", g_config.tcpVariant);
 
     // Workload parameters
     cmd.AddValue("workload", "Workload type (pingpong|rpc)", g_config.workload);
