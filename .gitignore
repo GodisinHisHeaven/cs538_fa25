@@ -6,6 +6,9 @@ ns-3/testpy-output/
 ns-3/*.pyc
 ns-3/.lock-*
 
+# Simulation output directories
+ns-3/out/
+
 # PCAP and animation files
 ns-3/*.pcap
 ns-3/*.xml
