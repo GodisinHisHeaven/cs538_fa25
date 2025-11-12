@@ -27,3 +27,5 @@ ns-3/*.tr
 
 # Claude
 .claude/
+
+**/.venv/
