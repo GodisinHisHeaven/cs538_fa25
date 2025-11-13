@@ -10,6 +10,7 @@
  * - Per-request latency logging (JSONL)
  * - Optional event timeline logging
  * - Summary statistics (p50/p95/p99)
+ * - PCAP capture support
  */
 
 #include "delay_hooks.h"
@@ -39,11 +40,11 @@ NS_LOG_COMPONENT_DEFINE("HdRunner");
 struct RunConfig
 {
     // Network parameters
-    std::string linkRate = "10Gbps";
-    std::string linkDelay = "50us";
-    uint32_t mtu = 9000;  // 9K jumbo frames
+    std::string linkRate = "100Gbps";
+    std::string linkDelay = "58.65us"; // 118.7us|58.65us
+    uint32_t mtu = 4000;  // 4K TCP 
     std::string qdisc = "none";  // none or fq_codel
-    std::string transport = "udp";  // udp or tcp
+    std::string transport = "tcp";  // udp or tcp
     std::string tcpVariant = "TcpDctcp";  // TcpNewReno, TcpDctcp, etc.
 
     // Workload parameters
@@ -62,6 +63,10 @@ struct RunConfig
     uint32_t seed = 1;
     std::string runId = "auto";
     std::string outDir = "out/sim";
+
+    // PCAP parameters
+    bool enablePcap = false;
+    bool pcapPromiscuous = false;
 
     // Derived
     std::string fullOutDir;
@@ -248,6 +253,8 @@ WriteConfigLog()
     ofs << "  \"enableEgressHook\": " << (g_config.enableEgressHook ? "true" : "false") << ",\n";
     ofs << "  \"enableIngressHook\": " << (g_config.enableIngressHook ? "true" : "false") << ",\n";
     ofs << "  \"hookConfigPath\": \"" << g_config.hookConfigPath << "\",\n";
+    ofs << "  \"enablePcap\": " << (g_config.enablePcap ? "true" : "false") << ",\n";
+    ofs << "  \"pcapPromiscuous\": " << (g_config.pcapPromiscuous ? "true" : "false") << ",\n";
     ofs << "  \"seed\": " << g_config.seed << ",\n";
     ofs << "  \"runId\": \"" << g_config.runId << "\"\n";
     ofs << "}\n";
@@ -301,6 +308,7 @@ WriteSummary()
     }
     ofs << "Egress hook:     " << (g_config.enableEgressHook ? "enabled" : "disabled") << "\n";
     ofs << "Ingress hook:    " << (g_config.enableIngressHook ? "enabled" : "disabled") << "\n";
+    ofs << "PCAP enabled:    " << (g_config.enablePcap ? "yes" : "no") << "\n";
     ofs << "Seed:            " << g_config.seed << "\n\n";
 
     ofs << "Results:\n";
@@ -328,6 +336,15 @@ WriteSummary()
     std::cout << "p50: " << std::fixed << std::setprecision(2) << (p50 / 1000.0) << " μs\n";
     std::cout << "p95: " << std::fixed << std::setprecision(2) << (p95 / 1000.0) << " μs\n";
     std::cout << "p99: " << std::fixed << std::setprecision(2) << (p99 / 1000.0) << " μs\n";
+    
+    if (g_config.enablePcap)
+    {
+        std::cout << "\nPCAP files written to: " << g_config.fullOutDir << "\n";
+        std::cout << "  - hd_runner-host0.pcap (client)\n";
+        std::cout << "  - hd_runner-switch-0.pcap (switch-to-client)\n";
+        std::cout << "  - hd_runner-switch-1.pcap (switch-to-server)\n";
+        std::cout << "  - hd_runner-host1.pcap (server)\n";
+    }
 }
 
 // ============================================================================
@@ -670,7 +687,7 @@ RpcServerApp::HandleRequest(Ptr<Socket> socket)
 // ============================================================================
 
 void
-SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
+SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces, NetDeviceContainer& allDevices)
 {
     NS_LOG_INFO("Setting up Host0 → Switch → Host1 topology");
 
@@ -701,6 +718,10 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     link1.Add(switchNode);
     link1.Add(host1);
     NetDeviceContainer devices1 = p2p.Install(link1);
+
+    // Store all devices for PCAP capture
+    allDevices.Add(devices0);
+    allDevices.Add(devices1);
 
     // Install Internet stack on all nodes
     InternetStackHelper stack;
@@ -750,6 +771,61 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
 }
 
 // ============================================================================
+// PCAP Capture Setup
+// ============================================================================
+
+void
+EnablePcapCapture(const NodeContainer& hosts)
+{
+    if (!g_config.enablePcap)
+    {
+        return;
+    }
+
+    NS_LOG_INFO("Enabling PCAP capture");
+
+    PointToPointHelper p2p;
+    std::string pcapPrefix = g_config.fullOutDir + "/hd_runner";
+
+    // Capture on host0 (client) - device 0
+    if (g_config.pcapPromiscuous)
+    {
+        p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), true);
+    }
+    else
+    {
+        p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), false);
+    }
+
+    // Capture on switch - both interfaces (device 0 and 1)
+    // We need to get the switch node (node ID 1)
+    Ptr<Node> switchNode = NodeContainer::GetGlobal().Get(1);
+    if (g_config.pcapPromiscuous)
+    {
+        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(0), true);
+        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(1), true);
+    }
+    else
+    {
+        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(0), false);
+        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(1), false);
+    }
+
+    // Capture on host1 (server) - device 0
+    if (g_config.pcapPromiscuous)
+    {
+        p2p.EnablePcap(pcapPrefix + "-host1", hosts.Get(1)->GetDevice(0), true);
+    }
+    else
+    {
+        p2p.EnablePcap(pcapPrefix + "-host1", hosts.Get(1)->GetDevice(0), false);
+    }
+
+    NS_LOG_INFO("PCAP capture enabled on all interfaces");
+    NS_LOG_INFO("  Files will be written to: " << pcapPrefix << "-*.pcap");
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -784,6 +860,10 @@ main(int argc, char* argv[])
     cmd.AddValue("runId", "Run ID (auto or custom)", g_config.runId);
     cmd.AddValue("outDir", "Output directory", g_config.outDir);
 
+    // PCAP parameters
+    cmd.AddValue("enablePcap", "Enable PCAP packet capture", g_config.enablePcap);
+    cmd.AddValue("pcapPromiscuous", "Enable promiscuous mode for PCAP", g_config.pcapPromiscuous);
+
     cmd.Parse(argc, argv);
 
     // Set RNG seed for determinism
@@ -813,7 +893,11 @@ main(int argc, char* argv[])
     // Setup topology
     NodeContainer hosts;
     Ipv4InterfaceContainer interfaces;
-    SetupTopology(hosts, interfaces);
+    NetDeviceContainer allDevices;
+    SetupTopology(hosts, interfaces, allDevices);
+
+    // Enable PCAP capture if requested
+    EnablePcapCapture(hosts);
 
     // Setup applications
     uint16_t port = 9999;
@@ -842,6 +926,10 @@ main(int argc, char* argv[])
     NS_LOG_INFO("  Requests: " << g_config.nReq);
     NS_LOG_INFO("  Outstanding: " << g_config.outstanding);
     NS_LOG_INFO("  Req/Rsp size: " << g_config.reqBytes << "/" << g_config.rspBytes);
+    if (g_config.enablePcap)
+    {
+        NS_LOG_INFO("  PCAP: enabled" << (g_config.pcapPromiscuous ? " (promiscuous)" : ""));
+    }
 
     // Run simulation
     Simulator::Stop(Seconds(60.0));  // Max 60s
