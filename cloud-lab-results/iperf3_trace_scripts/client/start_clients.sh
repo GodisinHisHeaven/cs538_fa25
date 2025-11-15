@@ -4,13 +4,14 @@ set -euo pipefail
 # ---- Experiment Parameters ----
 IF="ens2f0np0"                    # Network interface on the client
 SERVER_IP="10.10.1.1"             # iperf3 server address
-BASE_PORT=5200
+BASE_PORT=5201
 TIME=30                            # Duration of test (seconds)
 CPU_CORES=(0 4 8 12)              # Cores to pin iperf3 instances on
 
 # ---- Output Locations ----
 DATE="$(date +%s)"
-LOGDIR="/users/edwinji2/understanding-the-host-network/logs/iperf3_trace_logs_parallel"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOGDIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOGDIR"
 
 # Array to store PIDs
@@ -71,9 +72,9 @@ sleep 2
 
 echo "[*] Done."
 echo "Results saved to: $LOGDIR"
-echo "  Core 0 (Port 5200): trace-$DATE-core0-port5200.pcap, iperf-$DATE-core0-port5200.log"
-echo "  Core 4 (Port 5201): trace-$DATE-core4-port5201.pcap, iperf-$DATE-core4-port5201.log"
-echo "  Core 8 (Port 5202): trace-$DATE-core8-port5202.pcap, iperf-$DATE-core8-port5202.log"
-echo "  Core 12 (Port 5203): trace-$DATE-core12-port5203.pcap, iperf-$DATE-core12-port5203.log"
+echo "  Core 0 (Port 5201): trace-$DATE-core0-port5201.pcap, iperf-$DATE-core0-port5201.log"
+echo "  Core 4 (Port 5202): trace-$DATE-core4-port5202.pcap, iperf-$DATE-core4-port5202.log"
+echo "  Core 8 (Port 5203): trace-$DATE-core8-port5203.pcap, iperf-$DATE-core8-port5203.log"
+echo "  Core 12 (Port 5204): trace-$DATE-core12-port5204.pcap, iperf-$DATE-core12-port5204.log"
 echo
 echo "Now run: python3 parse_pcap.py $LOGDIR/trace-$DATE-core*-port*.pcap"

@@ -43,9 +43,14 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/experiment_config.sh"
 
+# Set default remote directory if not specified in config
+REMOTE_DIR="${REMOTE_DIR:-~}"
+
 echo "=========================================="
 echo "Copying folders to CloudLab nodes"
 echo "=========================================="
+echo "Remote directory: $REMOTE_DIR"
+echo ""
 
 # Function to install dependencies on a node
 install_dependencies() {
@@ -55,6 +60,10 @@ install_dependencies() {
     echo ""
     echo "=== Installing dependencies on $node_name ($node) ==="
     echo ""
+    
+    # Copy mlnx-tools tarball to the node
+    echo "Copying mlnx-tools tarball..."
+    scp -i "$SSH_KEY" "${SCRIPT_DIR}/v24.10.1.tar.gz" "${USER}@${node}:/tmp/"
     
     ssh -i "$SSH_KEY" "${USER}@${node}" bash << 'ENDSSH'
         set -e  # Exit on error
@@ -68,13 +77,31 @@ install_dependencies() {
         echo "Step 3: Installing libpci-dev..."
         sudo apt-get install -y libpci-dev
         
-        echo "Step 4: Installing mlnx-tools..."
+        echo "Step 4: Creating python symlink for mlnx-tools..."
+        if [ ! -f /usr/bin/python ]; then
+            sudo ln -s /usr/bin/python3 /usr/bin/python
+            echo "Created symlink: /usr/bin/python -> /usr/bin/python3"
+        else
+            echo "Python symlink already exists"
+        fi
+        
+        echo "Step 5: Installing mlnx-tools..."
         mkdir -p /tmp/mlnx-tools
         cd /tmp/mlnx-tools
-        wget https://github.com/Mellanox/mlnx-tools/archive/refs/tags/v24.10.1.tar.gz
-        tar -xvf v24.10.1.tar.gz
+        tar -xvf /tmp/v24.10.1.tar.gz
         cd mlnx-tools-24.10.1
+        
+        echo "Installing mlnx-tools to /usr/bin..."
         sudo make install
+        
+        # Verify installation
+        if [ -f /usr/bin/mlnx_qos ]; then
+            echo "mlnx_qos installed successfully"
+        else
+            echo "Warning: mlnx_qos not found in /usr/bin"
+            echo "Checking alternative locations..."
+            sudo find /usr -name "mlnx_qos" 2>/dev/null || echo "mlnx_qos not found"
+        fi
         
         echo ""
         echo "✓ Dependencies installed successfully!"
@@ -102,13 +129,13 @@ copy_to_node() {
     
     # Copy setup-env.sh first
     echo "Copying setup-env.sh..."
-    scp -i "$SSH_KEY" "${SCRIPT_DIR}/setup-env.sh" "${USER}@${node}:~/"
+    scp -i "$SSH_KEY" "${SCRIPT_DIR}/setup-env.sh" "${USER}@${node}:${REMOTE_DIR}/"
     
     # Copy each specified folder
     for folder in "${folders[@]}"; do
         if [ -d "${SCRIPT_DIR}/${folder}" ]; then
             echo "Copying ${folder} folder..."
-            scp -i "$SSH_KEY" -r "${SCRIPT_DIR}/${folder}" "${USER}@${node}:~/"
+            scp -i "$SSH_KEY" -r "${SCRIPT_DIR}/${folder}" "${USER}@${node}:${REMOTE_DIR}/"
         else
             echo "Warning: ${folder} folder not found at ${SCRIPT_DIR}/${folder}"
         fi
@@ -128,7 +155,7 @@ copy_to_node() {
 echo "Verifying local folders..."
 missing_folders=()
 
-for folder in "client" "server" "stream" "setup-env.sh"; do
+for folder in "client" "server" "stream" "setup-env.sh" "v24.10.1.tar.gz"; do
     if [ ! -e "${SCRIPT_DIR}/${folder}" ]; then
         missing_folders+=("$folder")
     fi
@@ -164,15 +191,15 @@ copy_to_node "$NODE1" "Node 1" "server" "stream"
 echo ""
 echo "=== Compiling STREAM on Node 1 ==="
 echo ""
-ssh -i "$SSH_KEY" "${USER}@${NODE1}" bash << 'ENDSSH'
+ssh -i "$SSH_KEY" "${USER}@${NODE1}" bash << ENDSSH
     set -e  # Exit on error
     
     echo "Cleaning and compiling STREAM..."
-    cd ~/stream
+    cd ${REMOTE_DIR}/stream
     make clean 2>/dev/null || true
     make
     
-    if [ $? -eq 0 ]; then
+    if [ \$? -eq 0 ]; then
         echo ""
         echo "✓ STREAM compiled successfully!"
     else
@@ -195,8 +222,8 @@ echo "All files copied successfully!"
 echo "=========================================="
 echo ""
 echo "Summary:"
-echo "  Node 0: ~/client/ + ~/setup-env.sh"
-echo "  Node 1: ~/server/ + ~/stream/ + ~/setup-env.sh"
+echo "  Node 0: ${REMOTE_DIR}/client/ + ${REMOTE_DIR}/setup-env.sh"
+echo "  Node 1: ${REMOTE_DIR}/server/ + ${REMOTE_DIR}/stream/ + ${REMOTE_DIR}/setup-env.sh"
 echo ""
 echo "Next steps:"
 echo "  1. SSH into each node and run setup-env.sh if needed"

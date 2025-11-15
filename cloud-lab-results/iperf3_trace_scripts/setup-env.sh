@@ -1,4 +1,5 @@
 #Disable frequency scaling and turbo boost for deterministic measurements
+collect ping data for propogation delay
 sudo ./disable-scaling.sh
 # Parameter values used in original experiment (https://github.com/host-architecture/understanding-the-host-network/blob/master/sigcomm24/tcp.md)
 # home='/users/edwinji2'

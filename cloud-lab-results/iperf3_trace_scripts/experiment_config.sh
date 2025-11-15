@@ -8,3 +8,6 @@ NODE1="c220g5-110918.wisc.cloudlab.us"
 # SSH configuration
 SSH_KEY="~/.ssh/school"
 USER="edwinji2"
+
+# Paths
+REMOTE_DIR="/users/edwinji2"

@@ -3,13 +3,14 @@ set -euo pipefail
 
 # ---- Server Parameters ----
 CPU_CORES=(0 4 8 12)              # Cores to pin iperf3 servers on
-BASE_PORT=5200
+BASE_PORT=5201
 INTERVAL=30                        # Reporting interval in seconds
 FORMAT="m"                         # Format (m = Mbits/sec)
 
 # ---- Output Locations ----
 DATE="$(date +%s)"
-LOGDIR="/users/edwinji2/understanding-the-host-network/logs/iperf3_server_logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOGDIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOGDIR"
 
 # Array to store PIDs
@@ -36,10 +37,10 @@ done
 echo "[*] All iperf3 servers started successfully!"
 echo
 echo "Server instances:"
-echo "  Core 0  - Port 5200 - PID ${SERVER_PIDS[0]}"
-echo "  Core 4  - Port 5201 - PID ${SERVER_PIDS[1]}"
-echo "  Core 8  - Port 5202 - PID ${SERVER_PIDS[2]}"
-echo "  Core 12 - Port 5203 - PID ${SERVER_PIDS[3]}"
+echo "  Core 0  - Port 5201 - PID ${SERVER_PIDS[0]}"
+echo "  Core 4  - Port 5202 - PID ${SERVER_PIDS[1]}"
+echo "  Core 8  - Port 5203 - PID ${SERVER_PIDS[2]}"
+echo "  Core 12 - Port 5204 - PID ${SERVER_PIDS[3]}"
 echo
 echo "Logs directory: $LOGDIR"
 echo

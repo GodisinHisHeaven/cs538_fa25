@@ -3,14 +3,15 @@ set -euo pipefail
 
 # ---- STREAM Parameters ----
 CPU_CORES=(16 20 24 28)           # Cores to pin STREAM instances on
-STREAM_BIN="/users/edwinji2/understanding-the-host-network/stream/stream"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STREAM_BIN="$SCRIPT_DIR/../stream/stream"
 NUMA_NODE=0                        # NUMA node for memory binding
 OPERATION="ReadWrite64"            # STREAM operation
 DURATION=120                       # Duration in seconds
 
 # ---- Output Locations ----
 DATE="$(date +%s)"
-LOGDIR="/users/edwinji2/understanding-the-host-network/logs/stream_logs"
+LOGDIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOGDIR"
 
 # Array to store PIDs
@@ -42,7 +43,7 @@ echo "Logs directory: $LOGDIR"
 echo "Duration: $DURATION seconds"
 echo
 echo "To stop all STREAM instances, run:"
-echo "  sudo kill ${STREAM_PIDS[@]}"
+echo "  sudo kill ${STREAM_PIDS[@]} 2>/dev/null"
 echo
 echo "Or kill them individually by PID"
 
