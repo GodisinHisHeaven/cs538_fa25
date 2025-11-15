@@ -10,7 +10,7 @@
  * - Per-request latency logging (JSONL)
  * - Optional event timeline logging
  * - Summary statistics (p50/p95/p99)
- * - PCAP capture support
+ * - PCAP capture support (client-side only)
  */
 
 #include "delay_hooks.h"
@@ -66,7 +66,6 @@ struct RunConfig
 
     // PCAP parameters
     bool enablePcap = false;
-    bool pcapPromiscuous = false;
 
     // Derived
     std::string fullOutDir;
@@ -254,7 +253,6 @@ WriteConfigLog()
     ofs << "  \"enableIngressHook\": " << (g_config.enableIngressHook ? "true" : "false") << ",\n";
     ofs << "  \"hookConfigPath\": \"" << g_config.hookConfigPath << "\",\n";
     ofs << "  \"enablePcap\": " << (g_config.enablePcap ? "true" : "false") << ",\n";
-    ofs << "  \"pcapPromiscuous\": " << (g_config.pcapPromiscuous ? "true" : "false") << ",\n";
     ofs << "  \"seed\": " << g_config.seed << ",\n";
     ofs << "  \"runId\": \"" << g_config.runId << "\"\n";
     ofs << "}\n";
@@ -339,11 +337,7 @@ WriteSummary()
     
     if (g_config.enablePcap)
     {
-        std::cout << "\nPCAP files written to: " << g_config.fullOutDir << "\n";
-        std::cout << "  - hd_runner-host0.pcap (client)\n";
-        std::cout << "  - hd_runner-switch-0.pcap (switch-to-client)\n";
-        std::cout << "  - hd_runner-switch-1.pcap (switch-to-server)\n";
-        std::cout << "  - hd_runner-host1.pcap (server)\n";
+        std::cout << "\nPCAP file written to: " << g_config.fullOutDir << "/hd_runner-host0.pcap\n";
     }
 }
 
@@ -771,7 +765,7 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces, NetDevic
 }
 
 // ============================================================================
-// PCAP Capture Setup
+// PCAP Capture Setup (Client-side only)
 // ============================================================================
 
 void
@@ -782,47 +776,16 @@ EnablePcapCapture(const NodeContainer& hosts)
         return;
     }
 
-    NS_LOG_INFO("Enabling PCAP capture");
+    NS_LOG_INFO("Enabling PCAP capture on client host");
 
     PointToPointHelper p2p;
     std::string pcapPrefix = g_config.fullOutDir + "/hd_runner";
 
-    // Capture on host0 (client) - device 0
-    if (g_config.pcapPromiscuous)
-    {
-        p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), true);
-    }
-    else
-    {
-        p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), false);
-    }
+    // Capture on host0 (client) only - device 0
+    p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), false);
 
-    // Capture on switch - both interfaces (device 0 and 1)
-    // We need to get the switch node (node ID 1)
-    Ptr<Node> switchNode = NodeContainer::GetGlobal().Get(1);
-    if (g_config.pcapPromiscuous)
-    {
-        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(0), true);
-        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(1), true);
-    }
-    else
-    {
-        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(0), false);
-        p2p.EnablePcap(pcapPrefix + "-switch", switchNode->GetDevice(1), false);
-    }
-
-    // Capture on host1 (server) - device 0
-    if (g_config.pcapPromiscuous)
-    {
-        p2p.EnablePcap(pcapPrefix + "-host1", hosts.Get(1)->GetDevice(0), true);
-    }
-    else
-    {
-        p2p.EnablePcap(pcapPrefix + "-host1", hosts.Get(1)->GetDevice(0), false);
-    }
-
-    NS_LOG_INFO("PCAP capture enabled on all interfaces");
-    NS_LOG_INFO("  Files will be written to: " << pcapPrefix << "-*.pcap");
+    NS_LOG_INFO("PCAP capture enabled on client interface");
+    NS_LOG_INFO("  File will be written to: " << pcapPrefix << "-host0.pcap");
 }
 
 // ============================================================================
@@ -848,7 +811,7 @@ main(int argc, char* argv[])
     cmd.AddValue("nReq", "Number of requests", g_config.nReq);
     cmd.AddValue("outstanding", "Outstanding requests", g_config.outstanding);
     cmd.AddValue("reqBytes", "Request size in bytes", g_config.reqBytes);
-    cmd.AddValue("rspBytes", "Response size in bytes", g_config.rspBytes);
+    cmd.AddValue("rspBytes","Response size in bytes", g_config.rspBytes);
 
     // Hook parameters
     cmd.AddValue("enableEgressHook", "Enable egress hook", g_config.enableEgressHook);
@@ -862,7 +825,6 @@ main(int argc, char* argv[])
 
     // PCAP parameters
     cmd.AddValue("enablePcap", "Enable PCAP packet capture", g_config.enablePcap);
-    cmd.AddValue("pcapPromiscuous", "Enable promiscuous mode for PCAP", g_config.pcapPromiscuous);
 
     cmd.Parse(argc, argv);
 
@@ -896,7 +858,7 @@ main(int argc, char* argv[])
     NetDeviceContainer allDevices;
     SetupTopology(hosts, interfaces, allDevices);
 
-    // Enable PCAP capture if requested
+    // Enable PCAP capture if requested (client-side only)
     EnablePcapCapture(hosts);
 
     // Setup applications
@@ -928,7 +890,7 @@ main(int argc, char* argv[])
     NS_LOG_INFO("  Req/Rsp size: " << g_config.reqBytes << "/" << g_config.rspBytes);
     if (g_config.enablePcap)
     {
-        NS_LOG_INFO("  PCAP: enabled" << (g_config.pcapPromiscuous ? " (promiscuous)" : ""));
+        NS_LOG_INFO("  PCAP: enabled (client-side only)");
     }
 
     // Run simulation
