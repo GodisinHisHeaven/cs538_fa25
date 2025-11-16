@@ -5,9 +5,9 @@
  * A deterministic experiment harness using iperf3 over DCTCP
  * Features:
  * - Deterministic Host0 → Switch → Host1 topology
- * - Ping-pong and RPC workloads
- * - No-op delay hooks (DelayEgress/DelayIngress) for future model integration
- * - Per-request latency logging (JSONL)
+ * - 4 parallel iperf3 flows
+ * - Delay hooks (DelayEgress/DelayIngress)
+ * - Per-flow latency logging (JSONL)
  * - Optional event timeline logging
  * - Summary statistics (p50/p95/p99)
  * - PCAP capture support (client-side only)
@@ -41,14 +41,16 @@ NS_LOG_COMPONENT_DEFINE("Iperf3DctcpRunner");
 struct RunConfig
 {
     // Network parameters
-    std::string linkRate = "25Gbps";
+    std::string linkRate = "100Gbps";  // Changed to 100 Gbps
     std::string linkDelay = "58.65us"; // 118.7us|58.65us
     uint32_t mtu = 4000;  // 4K MTU for DCTCP
     std::string tcpVariant = "TcpDctcp";
 
     // iperf3 parameters
-    uint32_t duration = 10;  // Test duration in seconds
-    std::string dataRate = "10Gbps";  // Target data rate for iperf3
+    uint32_t duration = 10;  // Test duration in seconds (should be > time to transmit maxBytes)
+    uint32_t numFlows = 4;   // Number of parallel flows
+    std::string dataRate = ""; //Unused
+    uint64_t maxBytes = 0;   // Max bytes per flow (0 = unlimited)
 
     // Hook parameters
     bool enableEgressHook = false;
@@ -80,7 +82,7 @@ struct FlowStats
     double endTime = 0.0;
 };
 
-static FlowStats g_flowStats;
+static std::vector<FlowStats> g_flowStats;
 
 // ============================================================================
 // Utility Functions
@@ -99,6 +101,7 @@ GenerateRunId()
     uint32_t hash = g_config.seed;
     hash ^= std::hash<std::string>{}(g_config.dataRate);
     hash ^= g_config.duration * 31;
+    hash ^= g_config.numFlows * 17;
 
     oss << "-" << std::hex << std::setw(6) << std::setfill('0') << (hash & 0xFFFFFF);
 
@@ -138,7 +141,9 @@ WriteConfigLog()
     ofs << "  \"mtu\": " << g_config.mtu << ",\n";
     ofs << "  \"tcpVariant\": \"" << g_config.tcpVariant << "\",\n";
     ofs << "  \"duration\": " << g_config.duration << ",\n";
-    ofs << "  \"dataRate\": \"" << g_config.dataRate << "\",\n";
+    ofs << "  \"numFlows\": " << g_config.numFlows << ",\n";
+    ofs << "  \"dataRatePerFlow\": \"" << g_config.dataRate << "\",\n";
+    ofs << "  \"maxBytesPerFlow\": " << g_config.maxBytes << ",\n";
     ofs << "  \"enableEgressHook\": " << (g_config.enableEgressHook ? "true" : "false") << ",\n";
     ofs << "  \"enableIngressHook\": " << (g_config.enableIngressHook ? "true" : "false") << ",\n";
     ofs << "  \"hookConfigPath\": \"" << g_config.hookConfigPath << "\",\n";
@@ -163,11 +168,8 @@ WriteSummary()
         return;
     }
 
-    double duration = g_flowStats.endTime - g_flowStats.startTime;
-    double throughputMbps = (g_flowStats.rxBytes * 8.0) / (duration * 1e6);
-
-    ofs << "CS538 iperf3 DCTCP Experiment - Summary\n";
-    ofs << "========================================\n\n";
+    ofs << "CS538 iperf3 DCTCP Experiment - Summary (4 Flows)\n";
+    ofs << "===================================================\n\n";
 
     ofs << "Run ID: " << g_config.runId << "\n\n";
 
@@ -175,29 +177,77 @@ WriteSummary()
     ofs << "--------------\n";
     ofs << "TCP variant:     " << g_config.tcpVariant << "\n";
     ofs << "Duration:        " << g_config.duration << " seconds\n";
-    ofs << "Target rate:     " << g_config.dataRate << "\n";
+    ofs << "Number of flows: " << g_config.numFlows << "\n";
+    ofs << "Per-flow rate:   " << g_config.dataRate << "\n";
+    ofs << "Max bytes/flow:  " << (g_config.maxBytes == 0 ? "unlimited" : std::to_string(g_config.maxBytes)) << "\n";
     ofs << "Link rate:       " << g_config.linkRate << "\n";
     ofs << "Link delay:      " << g_config.linkDelay << "\n";
     ofs << "MTU:             " << g_config.mtu << " bytes\n";
+    ofs << "Socket buffers:  1 MB (fixed)\n";
+    ofs << "ECN:             enabled\n";
     ofs << "Egress hook:     " << (g_config.enableEgressHook ? "enabled" : "disabled") << "\n";
     ofs << "Ingress hook:    " << (g_config.enableIngressHook ? "enabled" : "disabled") << "\n";
     ofs << "PCAP enabled:    " << (g_config.enablePcap ? "yes (client only)" : "no") << "\n";
     ofs << "Seed:            " << g_config.seed << "\n\n";
 
-    ofs << "Results:\n";
-    ofs << "--------\n";
-    ofs << "Actual duration: " << std::fixed << std::setprecision(3) << duration << " seconds\n";
-    ofs << "TX bytes:        " << g_flowStats.txBytes << "\n";
-    ofs << "RX bytes:        " << g_flowStats.rxBytes << "\n";
-    ofs << "TX packets:      " << g_flowStats.txPackets << "\n";
-    ofs << "RX packets:      " << g_flowStats.rxPackets << "\n";
-    ofs << "Throughput:      " << std::fixed << std::setprecision(2) << throughputMbps << " Mbps\n";
-    ofs << "Throughput:      " << std::fixed << std::setprecision(2) << (throughputMbps / 1000.0) << " Gbps\n";
+    // Per-flow statistics
+    uint64_t totalTxBytes = 0;
+    uint64_t totalRxBytes = 0;
+    uint64_t totalTxPackets = 0;
+    uint64_t totalRxPackets = 0;
 
-    if (g_flowStats.txPackets > 0)
+    ofs << "Per-Flow Results:\n";
+    ofs << "-----------------\n";
+    for (size_t i = 0; i < g_flowStats.size(); i++)
     {
-        double lossRate = 100.0 * (1.0 - (double)g_flowStats.rxPackets / g_flowStats.txPackets);
-        ofs << "Loss rate:       " << std::fixed << std::setprecision(4) << lossRate << " %\n";
+        const FlowStats& fs = g_flowStats[i];
+        double duration = fs.endTime - fs.startTime;
+        double throughputMbps = (fs.rxBytes * 8.0) / (duration * 1e6);
+
+        ofs << "\nFlow " << i << " (port " << (5201 + i) << "):\n";
+        ofs << "  Duration:   " << std::fixed << std::setprecision(3) << duration << " seconds\n";
+        ofs << "  TX bytes:   " << fs.txBytes << "\n";
+        ofs << "  RX bytes:   " << fs.rxBytes << "\n";
+        ofs << "  TX packets: " << fs.txPackets << "\n";
+        ofs << "  RX packets: " << fs.rxPackets << "\n";
+        ofs << "  Throughput: " << std::fixed << std::setprecision(2) << throughputMbps << " Mbps";
+        ofs << " (" << (throughputMbps / 1000.0) << " Gbps)\n";
+
+        if (fs.txPackets > 0)
+        {
+            double lossRate = 100.0 * (1.0 - (double)fs.rxPackets / fs.txPackets);
+            ofs << "  Loss rate:  " << std::fixed << std::setprecision(4) << lossRate << " %\n";
+        }
+
+        totalTxBytes += fs.txBytes;
+        totalRxBytes += fs.rxBytes;
+        totalTxPackets += fs.txPackets;
+        totalRxPackets += fs.rxPackets;
+    }
+
+    // Aggregate statistics
+    double avgDuration = 0.0;
+    for (const auto& fs : g_flowStats)
+    {
+        avgDuration += (fs.endTime - fs.startTime);
+    }
+    avgDuration /= g_flowStats.size();
+
+    double totalThroughputMbps = (totalRxBytes * 8.0) / (avgDuration * 1e6);
+
+    ofs << "\n\nAggregate Results:\n";
+    ofs << "------------------\n";
+    ofs << "Total TX bytes:      " << totalTxBytes << "\n";
+    ofs << "Total RX bytes:      " << totalRxBytes << "\n";
+    ofs << "Total TX packets:    " << totalTxPackets << "\n";
+    ofs << "Total RX packets:    " << totalRxPackets << "\n";
+    ofs << "Aggregate throughput: " << std::fixed << std::setprecision(2) << totalThroughputMbps << " Mbps";
+    ofs << " (" << (totalThroughputMbps / 1000.0) << " Gbps)\n";
+
+    if (totalTxPackets > 0)
+    {
+        double overallLossRate = 100.0 * (1.0 - (double)totalRxPackets / totalTxPackets);
+        ofs << "Overall loss rate:    " << std::fixed << std::setprecision(4) << overallLossRate << " %\n";
     }
 
     ofs.close();
@@ -205,11 +255,11 @@ WriteSummary()
 
     // Also print to console
     std::cout << "\n=== Summary ===\n";
-    std::cout << "Duration: " << std::fixed << std::setprecision(3) << duration << " seconds\n";
-    std::cout << "Throughput: " << std::fixed << std::setprecision(2) << throughputMbps << " Mbps";
-    std::cout << " (" << (throughputMbps / 1000.0) << " Gbps)\n";
-    std::cout << "TX/RX bytes: " << g_flowStats.txBytes << " / " << g_flowStats.rxBytes << "\n";
-    std::cout << "TX/RX packets: " << g_flowStats.txPackets << " / " << g_flowStats.rxPackets << "\n";
+    std::cout << "Flows: " << g_config.numFlows << "\n";
+    std::cout << "Aggregate throughput: " << std::fixed << std::setprecision(2) << totalThroughputMbps << " Mbps";
+    std::cout << " (" << (totalThroughputMbps / 1000.0) << " Gbps)\n";
+    std::cout << "Total TX/RX bytes: " << totalTxBytes << " / " << totalRxBytes << "\n";
+    std::cout << "Total TX/RX packets: " << totalTxPackets << " / " << totalRxPackets << "\n";
     
     if (g_config.enablePcap)
     {
@@ -223,17 +273,17 @@ WriteSummary()
 // ============================================================================
 
 void
-TxTrace(Ptr<const Packet> packet)
+TxTrace(uint32_t flowId, Ptr<const Packet> packet)
 {
-    g_flowStats.txBytes += packet->GetSize();
-    g_flowStats.txPackets++;
+    g_flowStats[flowId].txBytes += packet->GetSize();
+    g_flowStats[flowId].txPackets++;
 }
 
 void
-RxTrace(Ptr<const Packet> packet, const Address& address)
+RxTrace(uint32_t flowId, Ptr<const Packet> packet, const Address& address)
 {
-    g_flowStats.rxBytes += packet->GetSize();
-    g_flowStats.rxPackets++;
+    g_flowStats[flowId].rxBytes += packet->GetSize();
+    g_flowStats[flowId].rxPackets++;
 }
 
 // ============================================================================
@@ -243,17 +293,17 @@ RxTrace(Ptr<const Packet> packet, const Address& address)
 void
 SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
 {
-    NS_LOG_INFO("Setting up Host0 → Switch → Host1 topology for iperf3");
+    NS_LOG_INFO("Setting up Host0 (server) - Switch - Host1 (client) topology for iperf3");
 
-    // Create 3 nodes: Host0 (client), Switch, Host1 (server)
+    // Create 3 nodes: Host0 (server), Switch, Host1 (client)
     NodeContainer allNodes;
     allNodes.Create(3);
     Ptr<Node> host0 = allNodes.Get(0);
     Ptr<Node> switchNode = allNodes.Get(1);
     Ptr<Node> host1 = allNodes.Get(2);
 
-    hosts.Add(host0);  // Host0 - iperf3 client
-    hosts.Add(host1);  // Host1 - iperf3 server
+    hosts.Add(host0);  // Host0 - iperf3 server
+    hosts.Add(host1);  // Host1 - iperf3 client
 
     // Configure point-to-point links
     PointToPointHelper p2p;
@@ -277,21 +327,13 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     InternetStackHelper stack;
 
     // Configure TCP DCTCP
-    Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue("ns3::" + g_config.tcpVariant));
+    std::string transport_prot = std::string("ns3::") + g_config.tcpVariant;
+    Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(TypeId::LookupByName(transport_prot)));
     
-    // DCTCP specific settings
+    // DCTCP specific settings - ECN enabled
     Config::SetDefault("ns3::TcpSocketBase::UseEcn", StringValue("On"));
     
-    // Configure RED queue disc for ECN marking
-    Config::SetDefault("ns3::RedQueueDisc::UseEcn", BooleanValue(true));
-    Config::SetDefault("ns3::RedQueueDisc::UseHardDrop", BooleanValue(false));
-    Config::SetDefault("ns3::RedQueueDisc::MeanPktSize", UintegerValue(g_config.mtu));
-    Config::SetDefault("ns3::RedQueueDisc::QW", DoubleValue(1.0));
-    Config::SetDefault("ns3::RedQueueDisc::MinTh", DoubleValue(20));
-    Config::SetDefault("ns3::RedQueueDisc::MaxTh", DoubleValue(60));
-    
     // TCP buffer sizes - 1 MB (fixed, no auto-tuning)
-    // Disable auto-tuning by setting min/max to same value
     Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(1048576)); // 1MB
     Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(1048576)); // 1MB
     Config::SetDefault("ns3::TcpSocketState::EnablePacing", BooleanValue(false)); // Disable pacing
@@ -307,38 +349,32 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
 
     stack.Install(allNodes);
 
-    // Install RED queue disc on switch interfaces for DCTCP ECN marking
-    TrafficControlHelper tch;
-    tch.SetRootQueueDisc("ns3::RedQueueDisc");
-    tch.Install(devices0);
-    tch.Install(devices1);
-
     // Assign IP addresses
     Ipv4AddressHelper address;
 
     // Subnet for Host0 ↔ Switch
-    address.SetBase("10.1.1.0", "255.255.255.0");
+    address.SetBase("10.10.1.0", "255.255.255.0");
     Ipv4InterfaceContainer interfaces0 = address.Assign(devices0);
 
     // Subnet for Switch ↔ Host1
-    address.SetBase("10.1.2.0", "255.255.255.0");
+    address.SetBase("10.10.2.0", "255.255.255.0");
     Ipv4InterfaceContainer interfaces1 = address.Assign(devices1);
 
     // Enable global routing
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
     // Store host interfaces
-    interfaces.Add(interfaces0.Get(0));  // Host0: 10.1.1.1
-    interfaces.Add(interfaces1.Get(1));  // Host1: 10.1.2.2
+    interfaces.Add(interfaces0.Get(0));  // Host0 (server): 10.10.1.1
+    interfaces.Add(interfaces1.Get(1));  // Host1 (client): 10.10.2.2
 
     NS_LOG_INFO("Topology setup complete");
-    NS_LOG_INFO("  Host0 (client): " << interfaces.GetAddress(0));
-    NS_LOG_INFO("  Switch: 10.1.1.2 / 10.1.2.1");
-    NS_LOG_INFO("  Host1 (server): " << interfaces.GetAddress(1));
+    NS_LOG_INFO("  Host0 (server): " << interfaces.GetAddress(0));
+    NS_LOG_INFO("  Switch: 10.10.1.2 / 10.10.2.1");
+    NS_LOG_INFO("  Host1 (client): " << interfaces.GetAddress(1));
 }
 
 // ============================================================================
-// PCAP Capture Setup (Client-side only
+// PCAP Capture Setup (Client-side only)
 // ============================================================================
 
 void
@@ -354,9 +390,8 @@ EnablePcapCapture(const NodeContainer& hosts)
     PointToPointHelper p2p;
     std::string pcapPrefix = g_config.fullOutDir + "/iperf3_dctcp-client";
 
-
-    // Capture only on host0 (client) - device 0
-    p2p.EnablePcap(pcapPrefix, hosts.Get(0)->GetDevice(0), false);
+    // Capture only on host1 (client) - device 0
+    p2p.EnablePcap(pcapPrefix, hosts.Get(1)->GetDevice(0), false);
 
     NS_LOG_INFO("PCAP capture enabled on client interface");
     NS_LOG_INFO("  File will be written to: " << pcapPrefix << ".pcap");
@@ -380,7 +415,9 @@ main(int argc, char* argv[])
 
     // iperf3 parameters
     cmd.AddValue("duration", "Test duration in seconds", g_config.duration);
-    cmd.AddValue("dataRate", "Target data rate", g_config.dataRate);
+    cmd.AddValue("numFlows", "Number of parallel flows", g_config.numFlows);
+    cmd.AddValue("dataRate", "Target data rate per flow", g_config.dataRate);
+    cmd.AddValue("maxBytes", "Max bytes to transmit per flow (0=unlimited)", g_config.maxBytes);
 
     // Hook parameters
     cmd.AddValue("enableEgressHook", "Enable egress hook", g_config.enableEgressHook);
@@ -393,7 +430,6 @@ main(int argc, char* argv[])
     cmd.AddValue("outDir", "Output directory", g_config.outDir);
 
     // PCAP parameters
-
     cmd.AddValue("enablePcap", "Enable PCAP packet capture (client only)", g_config.enablePcap);
 
     cmd.Parse(argc, argv);
@@ -428,60 +464,71 @@ main(int argc, char* argv[])
     SetupTopology(hosts, interfaces);
 
     // Enable PCAP capture on client only
-
     EnablePcapCapture(hosts);
 
-    // Setup iperf3-like bulk send application
-    uint16_t port = 5201;  // Standard iperf3 port
+    // Initialize flow statistics
+    g_flowStats.resize(g_config.numFlows);
 
-    // Server (sink) on Host1
-    PacketSinkHelper sinkHelper("ns3::TcpSocketFactory",
-                                InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer sinkApp = sinkHelper.Install(hosts.Get(1));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(g_config.duration + 5.0));
+    // Setup multiple iperf3-like flows (ports 5201-5204)
+    uint16_t basePort = 5201;
 
-    // Client (bulk sender) on Host0
-    // Note: BulkSendApplication doesn't support rate limiting
-    // For rate-limited TCP, would need OnOffApplication with DataRate attribute
-    // Current implementation sends as fast as TCP allows (like iperf3 without -b)
-    BulkSendHelper bulkSendHelper("ns3::TcpSocketFactory",
-                                  InetSocketAddress(interfaces.GetAddress(1), port));
-    bulkSendHelper.SetAttribute("MaxBytes", UintegerValue(0)); // Unlimited
-    bulkSendHelper.SetAttribute("SendSize", UintegerValue(g_config.mtu - 52)); // Segment size
-    
-    ApplicationContainer clientApp = bulkSendHelper.Install(hosts.Get(0));
-    clientApp.Start(Seconds(0.5));
-    clientApp.Stop(Seconds(g_config.duration + 0.5));
+    NS_LOG_INFO("Setting up " << g_config.numFlows << " parallel iperf3 flows");
 
-    // Record flow start time
-    g_flowStats.startTime = 0.5;
-    g_flowStats.endTime = g_config.duration + 0.5;
-
-    // Connect trace sources for statistics
-    // Note: Use the application pointers directly instead of Config paths
-    Ptr<BulkSendApplication> bulkSend = DynamicCast<BulkSendApplication>(clientApp.Get(0));
-    Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApp.Get(0));
-    
-    if (bulkSend)
+    for (uint32_t i = 0; i < g_config.numFlows; i++)
     {
-        bulkSend->TraceConnectWithoutContext("Tx", MakeCallback(&TxTrace));
-    }
-    
-    if (sink)
-    {
-        sink->TraceConnectWithoutContext("Rx", MakeCallback(&RxTrace));
+        uint16_t port = basePort + i;
+
+        // Server (sink) on Host0 (10.10.1.1)
+        PacketSinkHelper sinkHelper("ns3::TcpSocketFactory",
+                                    InetSocketAddress(Ipv4Address::GetAny(), port));
+        ApplicationContainer sinkApp = sinkHelper.Install(hosts.Get(0));
+        sinkApp.Start(Seconds(0.0));
+        sinkApp.Stop(Seconds(g_config.duration + 5.0));
+
+        // Client (bulk sender) on Host1 (10.10.2.2) -> connects to server at 10.10.1.1
+        BulkSendHelper bulkSendHelper("ns3::TcpSocketFactory",
+                                      InetSocketAddress(interfaces.GetAddress(0), port));
+        bulkSendHelper.SetAttribute("MaxBytes", UintegerValue(g_config.maxBytes)); // 0 = unlimited
+        bulkSendHelper.SetAttribute("SendSize", UintegerValue(g_config.mtu - 52)); // Segment size
+        
+        ApplicationContainer clientApp = bulkSendHelper.Install(hosts.Get(1));
+        clientApp.Start(Seconds(0.5));
+        clientApp.Stop(Seconds(g_config.duration + 0.5));
+
+        // Record flow timing
+        g_flowStats[i].startTime = 0.5;
+        g_flowStats[i].endTime = g_config.duration + 0.5;
+
+        // Connect trace sources for per-flow statistics
+        Ptr<BulkSendApplication> bulkSend = DynamicCast<BulkSendApplication>(clientApp.Get(0));
+        Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApp.Get(0));
+        
+        if (bulkSend)
+        {
+            bulkSend->TraceConnectWithoutContext("Tx", MakeBoundCallback(&TxTrace, i));
+        }
+        
+        if (sink)
+        {
+            sink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&RxTrace, i));
+        }
+
+        NS_LOG_INFO("  Flow " << i << ": port " << port);
     }
 
     NS_LOG_INFO("Starting iperf3 simulation");
+    NS_LOG_INFO("  Flows: " << g_config.numFlows);
     NS_LOG_INFO("  Duration: " << g_config.duration << " seconds");
-    NS_LOG_INFO("  Target rate: " << g_config.dataRate);
-    NS_LOG_INFO("  MTU: " << g_config.mtu << " bytes");
+    NS_LOG_INFO("  Per-flow rate: " << g_config.dataRate);
+    NS_LOG_INFO("  Max bytes/flow: " << (g_config.maxBytes == 0 ? "unlimited" : std::to_string(g_config.maxBytes)));
+    NS_LOG_INFO("  MTU: " << g_config.mtu << " bytes (4K)");
+    NS_LOG_INFO("  Link rate: " << g_config.linkRate);
+    NS_LOG_INFO("  Socket buffers: 1 MB");
+    NS_LOG_INFO("  ECN: enabled");
     NS_LOG_INFO("  TCP variant: " << g_config.tcpVariant);
     if (g_config.enablePcap)
     {
         NS_LOG_INFO("  PCAP: enabled (client-side only)");
-
     }
 
     // Run simulation
@@ -500,19 +547,3 @@ main(int argc, char* argv[])
 
     return 0;
 }
-// ================================================================================
-// TCP RTT Latency Analysis
-// ================================================================================
-
-// Analyzing: iperf3_dctcp-client-0-0.pcap
-// --------------------------------------------------------------------------------
-//   Sample count: 2335887
-//   Min RTT:      0.234 ms
-//   Mean RTT:     0.238 ms
-//   Median (p50): 0.237 ms
-//   p90:          0.238 ms
-//   p95:          0.238 ms
-//   p99:          0.238 ms
-//   p99.9:        0.482 ms
-//   Max RTT:      201.913 ms
-//   Std Dev:      0.186 ms
