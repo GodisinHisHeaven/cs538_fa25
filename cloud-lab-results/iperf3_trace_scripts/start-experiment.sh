@@ -47,7 +47,7 @@ sleep 3
 echo ""
 echo "Step 3: Starting iperf3 clients on Node 0 (Client)..."
 echo "=========================================="
-ssh -i "$SSH_KEY" "${USER}@${NODE0}" "cd ${REMOTE_DIR}/client && chmod +x start_clients.sh && bash start_clients.sh"
+ssh -i "$SSH_KEY" "${USER}@${NODE0}" "cd ${REMOTE_DIR}/client && chmod +x start_clients.sh && bash start_clients.sh loaded"
 CLIENT_EXIT=$?
 
 echo ""
