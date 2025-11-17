@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STREAM_BIN="$SCRIPT_DIR/../stream/stream"
 NUMA_NODE=0                        # NUMA node for memory binding
 OPERATION="ReadWrite64"            # STREAM operation
-DURATION=120                       # Duration in seconds
+DURATION=60                       # Duration in seconds
 
 # ---- Output Locations ----
 DATE="$(date +%s)"

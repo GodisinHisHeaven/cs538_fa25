@@ -14,8 +14,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOGDIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOGDIR"
 
+# Single pcap file for all traffic
+PCAP="$LOGDIR/trace-$DATE-all-ports.pcap"
+
 # Array to store PIDs
-TCPDUMP_PIDS=()
 IPERF_PIDS=()
 
 sudo pkill -9 -f iperf || true #kill existing iperf servers/clients
@@ -23,22 +25,28 @@ sleep 1
 
 echo "[*] Starting ${#CPU_CORES[@]} iperf3 instances..."
 
-# Start tcpdump captures and iperf3 instances for each core
+# Build port range filter for tcpdump
+PORTS=()
 PORT_OFFSET=0
 for CORE in "${CPU_CORES[@]}"; do
     PORT=$((BASE_PORT + PORT_OFFSET))
-    PCAP="$LOGDIR/trace-$DATE-core$CORE-port$PORT.pcap"
-    IPERF_LOG="$LOGDIR/iperf-$DATE-core$CORE-port$PORT.log"
-    
-    echo "[*] Starting packet capture for core $CORE on port $PORT..."
-    sudo tcpdump -i "$IF" -s 128 tcp and host "$SERVER_IP" and port "$PORT" -w "$PCAP" &
-    TCPDUMP_PIDS+=($!)
-    
+    PORTS+=($PORT)
     PORT_OFFSET=$((PORT_OFFSET + 1))
-    sleep 1   # stagger starts slightly
 done
 
-sleep 4   # allow all captures to initialize
+# Create tcpdump filter: "tcp and host SERVER_IP and (port P1 or port P2 or ...)"
+FILTER="tcp and host $SERVER_IP and (port ${PORTS[0]}"
+for ((i=1; i<${#PORTS[@]}; i++)); do
+    FILTER="$FILTER or port ${PORTS[$i]}"
+done
+FILTER="$FILTER)"
+
+echo "[*] Starting single packet capture for all ports..."
+echo "    Filter: $FILTER"
+sudo tcpdump -i "$IF" -s 128 "$FILTER" -w "$PCAP" &
+TCPDUMP_PID=$!
+
+sleep 4   # allow capture to initialize
 
 # Start all iperf3 instances
 PORT_OFFSET=0
@@ -61,20 +69,23 @@ for PID in "${IPERF_PIDS[@]}"; do
     wait "$PID"
 done
 
-# Stop all tcpdump captures
-echo "[*] Stopping packet captures..."
-for PID in "${TCPDUMP_PIDS[@]}"; do
-    sudo kill -2 "$PID" 2>/dev/null || true  # SIGINT ensures pcap closes cleanly
-done
+# Stop tcpdump capture
+echo "[*] Stopping packet capture..."
+sudo kill -2 "$TCPDUMP_PID" 2>/dev/null || true  # SIGINT ensures pcap closes cleanly
 
 # Wait a moment for tcpdump to finish writing
 sleep 2
 
 echo "[*] Done."
 echo "Results saved to: $LOGDIR"
-echo "  Core 0 (Port 5201): trace-$DATE-core0-port5201.pcap, iperf-$DATE-core0-port5201.log"
-echo "  Core 4 (Port 5202): trace-$DATE-core4-port5202.pcap, iperf-$DATE-core4-port5202.log"
-echo "  Core 8 (Port 5203): trace-$DATE-core8-port5203.pcap, iperf-$DATE-core8-port5203.log"
-echo "  Core 12 (Port 5204): trace-$DATE-core12-port5204.pcap, iperf-$DATE-core12-port5204.log"
+echo ""
+echo "Packet capture: $PCAP"
+echo ""
+echo "iperf3 logs:"
+PORT_OFFSET=0
+for CORE in "${CPU_CORES[@]}"; do
+    PORT=$((BASE_PORT + PORT_OFFSET))
+    echo "  Core $CORE (Port $PORT): iperf-$DATE-core$CORE-port$PORT.log"
+    PORT_OFFSET=$((PORT_OFFSET + 1))
+done
 echo
-echo "Now run: python3 parse_pcap.py $LOGDIR/trace-$DATE-core*-port*.pcap"
