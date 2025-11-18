@@ -42,12 +42,12 @@ echo "Step 2: Starting STREAM instances on Node 1 (Server)..."
 echo "=========================================="
 ssh -i "$SSH_KEY" "${USER}@${NODE1}" "cd ${REMOTE_DIR}/server && chmod +x start_stream.sh && bash start_stream.sh" &
 STREAM_PID=$!
-sleep 3
+sleep 10
 
 echo ""
 echo "Step 3: Starting iperf3 clients on Node 0 (Client)..."
 echo "=========================================="
-ssh -i "$SSH_KEY" "${USER}@${NODE0}" "cd ${REMOTE_DIR}/client && chmod +x start_clients.sh && bash start_clients.sh loaded"
+ssh -i "$SSH_KEY" "${USER}@${NODE0}" "cd ${REMOTE_DIR}/client && chmod +x start_clients_multi.sh && bash start_clients_multi.sh loaded"
 CLIENT_EXIT=$?
 
 echo ""
