@@ -35,6 +35,129 @@ using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("Iperf3DctcpRunner");
 
 // ============================================================================
+// Custom Channel for Delay Injection
+// ============================================================================
+
+/**
+ * DelayedPointToPointChannel extends PointToPointChannel to inject
+ * host-induced delays during packet transmission.
+ *
+ * The channel intercepts packet transmission and adds egress delays
+ * (computed from DelayHooks) to the propagation delay before scheduling
+ * packet reception at the destination.
+ */
+class DelayedPointToPointChannel : public PointToPointChannel
+{
+public:
+    static TypeId GetTypeId();
+    DelayedPointToPointChannel();
+    virtual ~DelayedPointToPointChannel();
+
+    /**
+     * Override TransmitStart to inject egress delay.
+     * This is called when a device starts transmitting a packet.
+     */
+    virtual bool TransmitStart(Ptr<const Packet> p,
+                              Ptr<PointToPointNetDevice> src,
+                              Time txTime);
+
+private:
+    // Track sequence numbers for egress hook
+    std::map<uint32_t, uint32_t> m_egressSeq;
+};
+
+TypeId
+DelayedPointToPointChannel::GetTypeId()
+{
+    static TypeId tid = TypeId("DelayedPointToPointChannel")
+                            .SetParent<PointToPointChannel>()
+                            .SetGroupName("PointToPoint")
+                            .AddConstructor<DelayedPointToPointChannel>();
+    return tid;
+}
+
+DelayedPointToPointChannel::DelayedPointToPointChannel()
+    : PointToPointChannel()
+{
+}
+
+DelayedPointToPointChannel::~DelayedPointToPointChannel()
+{
+}
+
+bool
+DelayedPointToPointChannel::TransmitStart(Ptr<const Packet> p,
+                                         Ptr<PointToPointNetDevice> src,
+                                         Time txTime)
+{
+    NS_LOG_FUNCTION(this << p << src << txTime);
+
+    // Find the destination device (the other device on this channel)
+    // A point-to-point channel has exactly 2 devices
+    Ptr<PointToPointNetDevice> dst = nullptr;
+    if (GetNDevices() != 2)
+    {
+        NS_LOG_ERROR("DelayedPointToPointChannel must have exactly 2 devices");
+        return false;
+    }
+
+    // Find which device is NOT the source
+    Ptr<NetDevice> dev0 = GetDevice(0);
+    Ptr<NetDevice> dev1 = GetDevice(1);
+
+    if (dev0 == src)
+    {
+        dst = DynamicCast<PointToPointNetDevice>(dev1);
+    }
+    else if (dev1 == src)
+    {
+        dst = DynamicCast<PointToPointNetDevice>(dev0);
+    }
+    else
+    {
+        NS_LOG_ERROR("Source device not found on channel");
+        return false;
+    }
+
+    if (!dst)
+    {
+        NS_LOG_ERROR("Failed to cast destination device");
+        return false;
+    }
+
+    // Calculate egress delay if hook is enabled
+    Time egressDelay = NanoSeconds(0);
+    if (DelayHooks::IsEgressEnabled())
+    {
+        uint32_t srcNodeId = src->GetNode()->GetId();
+        uint32_t seq = m_egressSeq[srcNodeId]++;
+        uint32_t bytes = p->GetSize();
+        egressDelay = DelayHooks::DelayEgress(srcNodeId, bytes, seq);
+
+        NS_LOG_DEBUG("Egress delay injection: node=" << srcNodeId
+                     << " seq=" << seq
+                     << " bytes=" << bytes
+                     << " delay=" << egressDelay.GetMicroSeconds() << "us");
+    }
+
+    // Get propagation delay from channel
+    Time propDelay = GetDelay();
+
+    // Total delay = egress delay + propagation delay + transmission time
+    Time totalDelay = egressDelay + propDelay + txTime;
+
+    // Schedule packet reception at destination with correct node context
+    // Using ScheduleWithContext ensures the simulator context is set to the destination node
+    Simulator::ScheduleWithContext(dst->GetNode()->GetId(),
+                                   totalDelay,
+                                   &PointToPointNetDevice::Receive,
+                                   dst,
+                                   p->Copy());
+
+    return true;
+}
+
+// ============================================================================
 // Global Configuration and State
 // ============================================================================
 
@@ -309,9 +432,9 @@ WriteSummary()
             }
         }
 
-        ofs << "\nNOTE: This is a measurement-only implementation.\n";
-        ofs << "Delays are calculated but NOT actually injected into packet transmission.\n";
-        ofs << "This version uses trace callbacks (MacTx/MacRx) to measure what delays would be.\n";
+        ofs << "\nNOTE: Delay injection implementation using DelayedPointToPointChannel.\n";
+        ofs << "Egress delays are injected at the channel level during packet transmission.\n";
+        ofs << "Statistics above show the delays calculated and applied to each packet.\n";
     }
 
     ofs.close();
@@ -418,6 +541,7 @@ void
 SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
 {
     NS_LOG_INFO("Setting up Host0 (server) - Switch - Host1 (client) topology for iperf3");
+    NS_LOG_INFO("Using DelayedPointToPointChannel for delay injection");
 
     // Create 3 nodes: Host0 (server), Switch, Host1 (client)
     NodeContainer allNodes;
@@ -429,23 +553,100 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     hosts.Add(host0);  // Host0 - iperf3 server
     hosts.Add(host1);  // Host1 - iperf3 client
 
-    // Configure point-to-point links
-    PointToPointHelper p2p;
-    p2p.SetDeviceAttribute("DataRate", StringValue(g_config.linkRate));
-    p2p.SetChannelAttribute("Delay", StringValue(g_config.linkDelay));
-    p2p.SetDeviceAttribute("Mtu", UintegerValue(g_config.mtu));
+    // Parse link parameters
+    DataRateValue linkRateValue;
+    TimeValue linkDelayValue;
+    DataRate linkRateParsed(g_config.linkRate);
+    linkRateValue = DataRateValue(linkRateParsed);
+    linkDelayValue = TimeValue(Time(g_config.linkDelay));
 
-    // Create link: Host0 ↔ Switch
-    NodeContainer link0;
-    link0.Add(host0);
-    link0.Add(switchNode);
-    NetDeviceContainer devices0 = p2p.Install(link0);
+    // Create custom delayed channels and devices manually
+    NetDeviceContainer devices0;
+    NetDeviceContainer devices1;
 
-    // Create link: Switch ↔ Host1
-    NodeContainer link1;
-    link1.Add(switchNode);
-    link1.Add(host1);
-    NetDeviceContainer devices1 = p2p.Install(link1);
+    // ===== Link 0: Host0 ↔ Switch =====
+    {
+        // Create devices
+        Ptr<PointToPointNetDevice> dev0 = CreateObject<PointToPointNetDevice>();
+        Ptr<PointToPointNetDevice> dev1 = CreateObject<PointToPointNetDevice>();
+
+        // Configure devices
+        dev0->SetAddress(Mac48Address::Allocate());
+        dev1->SetAddress(Mac48Address::Allocate());
+        dev0->SetDataRate(linkRateParsed);
+        dev1->SetDataRate(linkRateParsed);
+        dev0->SetMtu(g_config.mtu);
+        dev1->SetMtu(g_config.mtu);
+
+        // Create and configure custom channel
+        Ptr<DelayedPointToPointChannel> channel = CreateObject<DelayedPointToPointChannel>();
+        channel->SetAttribute("Delay", linkDelayValue);
+
+        // Attach devices to nodes
+        host0->AddDevice(dev0);
+        switchNode->AddDevice(dev1);
+        dev0->SetNode(host0);
+        dev1->SetNode(switchNode);
+
+        // Attach devices to channel
+        dev0->Attach(channel);
+        dev1->Attach(channel);
+
+        // Create queues
+        Ptr<Queue<Packet>> queue0 = CreateObject<DropTailQueue<Packet>>();
+        Ptr<Queue<Packet>> queue1 = CreateObject<DropTailQueue<Packet>>();
+        queue0->SetMaxSize(QueueSize("100p"));
+        queue1->SetMaxSize(QueueSize("100p"));
+        dev0->SetQueue(queue0);
+        dev1->SetQueue(queue1);
+
+        devices0.Add(dev0);
+        devices0.Add(dev1);
+
+        NS_LOG_INFO("Created delayed channel for Host0 ↔ Switch link");
+    }
+
+    // ===== Link 1: Switch ↔ Host1 =====
+    {
+        // Create devices
+        Ptr<PointToPointNetDevice> dev0 = CreateObject<PointToPointNetDevice>();
+        Ptr<PointToPointNetDevice> dev1 = CreateObject<PointToPointNetDevice>();
+
+        // Configure devices
+        dev0->SetAddress(Mac48Address::Allocate());
+        dev1->SetAddress(Mac48Address::Allocate());
+        dev0->SetDataRate(linkRateParsed);
+        dev1->SetDataRate(linkRateParsed);
+        dev0->SetMtu(g_config.mtu);
+        dev1->SetMtu(g_config.mtu);
+
+        // Create and configure custom channel
+        Ptr<DelayedPointToPointChannel> channel = CreateObject<DelayedPointToPointChannel>();
+        channel->SetAttribute("Delay", linkDelayValue);
+
+        // Attach devices to nodes
+        switchNode->AddDevice(dev0);
+        host1->AddDevice(dev1);
+        dev0->SetNode(switchNode);
+        dev1->SetNode(host1);
+
+        // Attach devices to channel
+        dev0->Attach(channel);
+        dev1->Attach(channel);
+
+        // Create queues
+        Ptr<Queue<Packet>> queue0 = CreateObject<DropTailQueue<Packet>>();
+        Ptr<Queue<Packet>> queue1 = CreateObject<DropTailQueue<Packet>>();
+        queue0->SetMaxSize(QueueSize("100p"));
+        queue1->SetMaxSize(QueueSize("100p"));
+        dev0->SetQueue(queue0);
+        dev1->SetQueue(queue1);
+
+        devices1.Add(dev0);
+        devices1.Add(dev1);
+
+        NS_LOG_INFO("Created delayed channel for Switch ↔ Host1 link");
+    }
 
     // Install Internet stack with TCP DCTCP configuration
     InternetStackHelper stack;
@@ -590,10 +791,12 @@ main(int argc, char* argv[])
     // Enable PCAP capture on client only
     EnablePcapCapture(hosts);
 
-    // Connect delay hook traces to NetDevices (measurement-only mode)
+    // Connect delay hook traces to NetDevices for statistics tracking
+    // Note: Actual delay injection happens in DelayedPointToPointChannel
     if (g_config.enableEgressHook || g_config.enableIngressHook)
     {
-        NS_LOG_INFO("Connecting delay hook traces (measurement-only mode)");
+        NS_LOG_INFO("Connecting delay hook traces for statistics tracking");
+        NS_LOG_INFO("  (Actual egress delay injection happens in DelayedPointToPointChannel)");
         for (uint32_t i = 0; i < hosts.GetN(); i++)
         {
             Ptr<Node> node = hosts.Get(i);
@@ -603,7 +806,7 @@ main(int argc, char* argv[])
             {
                 bool connected = device->TraceConnectWithoutContext(
                     "MacTx", MakeBoundCallback(&EgressTraceCallback, i));
-                NS_LOG_INFO("  Node " << i << " egress hook: "
+                NS_LOG_INFO("  Node " << i << " egress stats trace: "
                                       << (connected ? "connected" : "FAILED"));
             }
 
@@ -611,7 +814,7 @@ main(int argc, char* argv[])
             {
                 bool connected = device->TraceConnectWithoutContext(
                     "MacRx", MakeBoundCallback(&IngressTraceCallback, i));
-                NS_LOG_INFO("  Node " << i << " ingress hook: "
+                NS_LOG_INFO("  Node " << i << " ingress stats trace: "
                                       << (connected ? "connected" : "FAILED"));
             }
         }
