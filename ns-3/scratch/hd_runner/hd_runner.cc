@@ -42,7 +42,7 @@ struct RunConfig
 {
     // Network parameters
     std::string linkRate = "100Gbps";  // Changed to 100 Gbps
-    std::string linkDelay = "58.65us"; // 118.7us|58.65us
+    std::string linkDelay = "61.25us"; // 0.245ms / 4 (from ping RTT measurements)
     uint32_t mtu = 4000;  // 4K MTU for DCTCP
     std::string tcpVariant = "TcpDctcp";
 
@@ -83,6 +83,17 @@ struct FlowStats
 };
 
 static std::vector<FlowStats> g_flowStats;
+
+// Delay hook statistics tracking
+struct HookStats
+{
+    uint64_t totalPackets = 0;
+    uint64_t totalDelayNs = 0;
+    uint64_t maxDelayNs = 0;
+};
+
+static std::map<uint32_t, HookStats> g_egressStats;
+static std::map<uint32_t, HookStats> g_ingressStats;
 
 // ============================================================================
 // Utility Functions
@@ -250,6 +261,59 @@ WriteSummary()
         ofs << "Overall loss rate:    " << std::fixed << std::setprecision(4) << overallLossRate << " %\n";
     }
 
+    // Delay hook statistics
+    if (g_config.enableEgressHook || g_config.enableIngressHook)
+    {
+        ofs << "\n\nDelay Hook Statistics:\n";
+        ofs << "----------------------\n";
+
+        if (g_config.enableEgressHook)
+        {
+            ofs << "\nEgress Hook (MacTx - before NIC transmission):\n";
+            for (const auto& entry : g_egressStats)
+            {
+                uint32_t nodeId = entry.first;
+                const HookStats& stats = entry.second;
+                if (stats.totalPackets > 0)
+                {
+                    double avgDelayUs = (double)stats.totalDelayNs / stats.totalPackets / 1000.0;
+                    double maxDelayUs = (double)stats.maxDelayNs / 1000.0;
+                    ofs << "  Node " << nodeId << ":\n";
+                    ofs << "    Packets processed: " << stats.totalPackets << "\n";
+                    ofs << "    Avg calculated delay: " << std::fixed << std::setprecision(3)
+                        << avgDelayUs << " us\n";
+                    ofs << "    Max calculated delay: " << std::fixed << std::setprecision(3)
+                        << maxDelayUs << " us\n";
+                }
+            }
+        }
+
+        if (g_config.enableIngressHook)
+        {
+            ofs << "\nIngress Hook (MacRx - before L3 delivery):\n";
+            for (const auto& entry : g_ingressStats)
+            {
+                uint32_t nodeId = entry.first;
+                const HookStats& stats = entry.second;
+                if (stats.totalPackets > 0)
+                {
+                    double avgDelayUs = (double)stats.totalDelayNs / stats.totalPackets / 1000.0;
+                    double maxDelayUs = (double)stats.maxDelayNs / 1000.0;
+                    ofs << "  Node " << nodeId << ":\n";
+                    ofs << "    Packets processed: " << stats.totalPackets << "\n";
+                    ofs << "    Avg calculated delay: " << std::fixed << std::setprecision(3)
+                        << avgDelayUs << " us\n";
+                    ofs << "    Max calculated delay: " << std::fixed << std::setprecision(3)
+                        << maxDelayUs << " us\n";
+                }
+            }
+        }
+
+        ofs << "\nNOTE: This is a measurement-only implementation.\n";
+        ofs << "Delays are calculated but NOT actually injected into packet transmission.\n";
+        ofs << "This version uses trace callbacks (MacTx/MacRx) to measure what delays would be.\n";
+    }
+
     ofs.close();
     NS_LOG_INFO("Wrote summary to summary.txt");
 
@@ -265,6 +329,66 @@ WriteSummary()
     {
         std::cout << "\nPCAP file written to: " << g_config.fullOutDir << "\n";
         std::cout << "  - iperf3_dctcp-client.pcap (client interface)\n";
+    }
+}
+
+// ============================================================================
+// Delay Hook Callbacks
+// ============================================================================
+
+// Per-node sequence counters for hook tracking
+static std::map<uint32_t, uint32_t> g_egressSeq;
+static std::map<uint32_t, uint32_t> g_ingressSeq;
+
+void
+EgressTraceCallback(uint32_t nodeId, Ptr<const Packet> packet)
+{
+    if (!DelayHooks::IsEgressEnabled())
+        return;
+
+    uint32_t seq = g_egressSeq[nodeId]++;
+    uint32_t bytes = packet->GetSize();
+    Time delay = DelayHooks::DelayEgress(nodeId, bytes, seq);
+
+    // Track statistics
+    g_egressStats[nodeId].totalPackets++;
+    g_egressStats[nodeId].totalDelayNs += delay.GetNanoSeconds();
+    if (delay.GetNanoSeconds() > g_egressStats[nodeId].maxDelayNs)
+    {
+        g_egressStats[nodeId].maxDelayNs = delay.GetNanoSeconds();
+    }
+
+    // Log if delay is non-zero
+    if (delay.GetNanoSeconds() > 0)
+    {
+        NS_LOG_DEBUG("Egress hook: node=" << nodeId << " seq=" << seq << " bytes=" << bytes
+                                          << " delay=" << delay.GetMicroSeconds() << "us");
+    }
+}
+
+void
+IngressTraceCallback(uint32_t nodeId, Ptr<const Packet> packet)
+{
+    if (!DelayHooks::IsIngressEnabled())
+        return;
+
+    uint32_t seq = g_ingressSeq[nodeId]++;
+    uint32_t bytes = packet->GetSize();
+    Time delay = DelayHooks::DelayIngress(nodeId, bytes, seq);
+
+    // Track statistics
+    g_ingressStats[nodeId].totalPackets++;
+    g_ingressStats[nodeId].totalDelayNs += delay.GetNanoSeconds();
+    if (delay.GetNanoSeconds() > g_ingressStats[nodeId].maxDelayNs)
+    {
+        g_ingressStats[nodeId].maxDelayNs = delay.GetNanoSeconds();
+    }
+
+    // Log if delay is non-zero
+    if (delay.GetNanoSeconds() > 0)
+    {
+        NS_LOG_DEBUG("Ingress hook: node=" << nodeId << " seq=" << seq << " bytes=" << bytes
+                                           << " delay=" << delay.GetMicroSeconds() << "us");
     }
 }
 
@@ -465,6 +589,33 @@ main(int argc, char* argv[])
 
     // Enable PCAP capture on client only
     EnablePcapCapture(hosts);
+
+    // Connect delay hook traces to NetDevices (measurement-only mode)
+    if (g_config.enableEgressHook || g_config.enableIngressHook)
+    {
+        NS_LOG_INFO("Connecting delay hook traces (measurement-only mode)");
+        for (uint32_t i = 0; i < hosts.GetN(); i++)
+        {
+            Ptr<Node> node = hosts.Get(i);
+            Ptr<NetDevice> device = node->GetDevice(0);
+
+            if (g_config.enableEgressHook)
+            {
+                bool connected = device->TraceConnectWithoutContext(
+                    "MacTx", MakeBoundCallback(&EgressTraceCallback, i));
+                NS_LOG_INFO("  Node " << i << " egress hook: "
+                                      << (connected ? "connected" : "FAILED"));
+            }
+
+            if (g_config.enableIngressHook)
+            {
+                bool connected = device->TraceConnectWithoutContext(
+                    "MacRx", MakeBoundCallback(&IngressTraceCallback, i));
+                NS_LOG_INFO("  Node " << i << " ingress hook: "
+                                      << (connected ? "connected" : "FAILED"));
+            }
+        }
+    }
 
     // Initialize flow statistics
     g_flowStats.resize(g_config.numFlows);
