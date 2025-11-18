@@ -131,6 +131,10 @@ copy_to_node() {
     echo "Copying setup-env.sh..."
     scp -i "$SSH_KEY" "${SCRIPT_DIR}/setup-env.sh" "${USER}@${node}:${REMOTE_DIR}/"
     
+    # Copy disable-scaling.sh 
+    echo "Copying disable-scaling.sh ..."
+    scp -i "$SSH_KEY" "${SCRIPT_DIR}/disable-scaling.sh " "${USER}@${node}:${REMOTE_DIR}/"
+
     # Copy each specified folder
     for folder in "${folders[@]}"; do
         if [ -d "${SCRIPT_DIR}/${folder}" ]; then
@@ -155,7 +159,7 @@ copy_to_node() {
 echo "Verifying local folders..."
 missing_folders=()
 
-for folder in "client" "server" "stream" "setup-env.sh" "v24.10.1.tar.gz"; do
+for folder in "client" "server" "stream" "setup-env.sh" "disable-scaling.sh" "v24.10.1.tar.gz"; do
     if [ ! -e "${SCRIPT_DIR}/${folder}" ]; then
         missing_folders+=("$folder")
     fi
@@ -182,10 +186,10 @@ echo "Dependencies installed on both nodes"
 echo "=========================================="
 echo ""
 
-# Copy to Node 0 (client + setup-env.sh)
+# Copy to Node 0 (client + setup-env.sh + disable-scaling.sh)
 copy_to_node "$NODE0" "Node 0" "client"
 
-# Copy to Node 1 (server, stream + setup-env.sh)
+# Copy to Node 1 (server, stream + setup-env.sh + disable-scaling.sh)
 copy_to_node "$NODE1" "Node 1" "server" "stream"
 
 echo ""
@@ -222,10 +226,10 @@ echo "All files copied successfully!"
 echo "=========================================="
 echo ""
 echo "Summary:"
-echo "  Node 0: ${REMOTE_DIR}/client/ + ${REMOTE_DIR}/setup-env.sh"
-echo "  Node 1: ${REMOTE_DIR}/server/ + ${REMOTE_DIR}/stream/ + ${REMOTE_DIR}/setup-env.sh"
+echo "  Node 0: ${REMOTE_DIR}/client/ + ${REMOTE_DIR}/setup-env.sh + ${REMOTE_DIR}/disable-scaling.sh"
+echo "  Node 1: ${REMOTE_DIR}/server/ + ${REMOTE_DIR}/stream/ + ${REMOTE_DIR}/setup-env.sh + ${REMOTE_DIR}/disable-scaling.sh"
 echo ""
 echo "Next steps:"
-echo "  1. SSH into each node and run setup-env.sh if needed"
+echo "  1. SSH into each node and run disable-scaling.sh and setup-env.sh if needed"
 echo "  2. Compile/build any necessary components"
 echo "  3. Run your experiments"
