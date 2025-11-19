@@ -651,18 +651,17 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
     Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(TypeId::LookupByName(transport_prot)));
 
     // TCP buffer sizes - 1 MB (fixed, no auto-tuning)
-    Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(1048576)); // 1MB
-    Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(1048576)); // 1MB
+    Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(1 << 20)); // 1MB
+    Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(1 << 20)); // 1MB
     Config::SetDefault("ns3::TcpSocketState::EnablePacing", BooleanValue(false)); // Disable pacing
     Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(g_config.mtu - 52)); // MTU - headers
     Config::SetDefault("ns3::TcpSocketBase::WindowScaling", BooleanValue(true)); // Enable window scaling
 
-    // Set min/max to same value to disable auto-tuning (if supported by variant)
     Config::SetDefault("ns3::TcpSocketBase::MinRto", TimeValue(Seconds(0.2))); // Min RTO
-    Config::SetDefault("ns3::TcpSocketBase::Timestamp", BooleanValue(true)); // Enable timestamps for better RTT
+    Config::SetDefault("ns3::TcpSocketBase::Timestamp", BooleanValue(true)); // Enable timestamps
 
     // Initial congestion window
-    Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(10)); // Start with 10 segments
+    Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(10));
 
     stack.Install(allNodes);
 
@@ -814,7 +813,7 @@ main(int argc, char* argv[])
     // Initialize flow statistics
     g_flowStats.resize(g_config.numFlows);
 
-    // Setup multiple iperf3-like flows (ports 5201-5204)
+    // Setup multiple iperf3-like flows (starting from port 5201)
     uint16_t basePort = 5201;
 
     NS_LOG_INFO("Setting up " << g_config.numFlows << " parallel iperf3 flows");
@@ -867,8 +866,6 @@ main(int argc, char* argv[])
     NS_LOG_INFO("  Max bytes/flow: " << (g_config.maxBytes == 0 ? "unlimited" : std::to_string(g_config.maxBytes)));
     NS_LOG_INFO("  MTU: " << g_config.mtu << " bytes (4K)");
     NS_LOG_INFO("  Link rate: " << g_config.linkRate);
-    NS_LOG_INFO("  Socket buffers: 1 MB");
-    NS_LOG_INFO("  ECN: enabled");
     NS_LOG_INFO("  TCP variant: " << g_config.tcpVariant);
     if (g_config.enablePcap)
     {
