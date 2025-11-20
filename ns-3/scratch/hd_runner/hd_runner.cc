@@ -2,23 +2,21 @@
 /*
  * CS538 Host Delay Experiment Runner
  *
- * A deterministic experiment harness for measuring host-delay effects
- * on network tail latency. Features:
+ * A deterministic experiment harness using iperf3
  * - Deterministic Host0 → Switch → Host1 topology
- * - Ping-pong and RPC workloads
- * - No-op delay hooks (DelayEgress/DelayIngress) for future model integration
- * - Per-request latency logging (JSONL)
- * - Optional event timeline logging
- * - Summary statistics (p50/p95/p99)
+ * - 4 parallel iperf3 flows
+ * - Delay hooks (DelayEgress/DelayIngress)
  * - PCAP capture support (client-side only)
  */
 
 #include "delay_hooks.h"
+#include "point-to-point-helper-custom.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
 #include "ns3/point-to-point-module.h"
+#include "ns3/traffic-control-module.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,8 +29,7 @@
 
 using namespace ns3;
 
-NS_LOG_COMPONENT_DEFINE("HdRunner");
-
+NS_LOG_COMPONENT_DEFINE("Iperf3Runner");
 // ============================================================================
 // Global Configuration and State
 // ============================================================================
@@ -40,24 +37,20 @@ NS_LOG_COMPONENT_DEFINE("HdRunner");
 struct RunConfig
 {
     // Network parameters
-    std::string linkRate = "100Gbps";
-    std::string linkDelay = "58.65us"; // 118.7us|58.65us
-    uint32_t mtu = 4000;  // 4K TCP 
-    std::string qdisc = "none";  // none or fq_codel
-    std::string transport = "tcp";  // udp or tcp
-    std::string tcpVariant = "TcpDctcp";  // TcpNewReno, TcpDctcp, etc.
+    std::string linkRate = "100Gbps";  // 100 Gbps NICs
+    std::string linkDelay = "61.25us"; // 0.245ms / 4 (from ping RTT measurements)
+    uint32_t mtu = 4000;  // 4K MTU
+    std::string tcpVariant = "TcpDctcp"; // Default to DCTCP
 
-    // Workload parameters
-    std::string workload = "pingpong";  // pingpong or rpc
-    uint32_t nReq = 10000;
-    uint32_t outstanding = 1;
-    uint32_t reqBytes = 1024;
-    uint32_t rspBytes = 1024;
+    // iperf3 parameters
+    uint32_t duration = 1;  // Test duration in seconds
+    uint32_t numFlows = 4;   // Number of parallel flows
+    uint64_t maxBytes = 0;   // Max bytes per flow (0 = unlimited)
 
     // Hook parameters
-    bool enableEgressHook = true;
-    bool enableIngressHook = true;
-    std::string hookConfigPath = "";
+    bool enableEgressHook = false;
+    bool enableIngressHook = false;
+    std::string hookConfigPath = ""; // Use empty string for default, look in delay_hooks.cc for details
 
     // Simulation parameters
     uint32_t seed = 1;
@@ -73,29 +66,29 @@ struct RunConfig
 
 static RunConfig g_config;
 
-// Latency tracking
-struct RpcRecord
+// Flow statistics tracking
+struct FlowStats
 {
-    uint32_t seq;
-    int64_t t_send_ns;
-    int64_t t_recv_ns;
-    int64_t lat_ns;
+    uint64_t txBytes = 0;
+    uint64_t rxBytes = 0;
+    uint64_t txPackets = 0;
+    uint64_t rxPackets = 0;
+    double startTime = 0.0;
+    double endTime = 0.0;
 };
 
-static std::vector<RpcRecord> g_rpcRecords;
-static uint32_t g_completedRequests = 0;
+static std::vector<FlowStats> g_flowStats;
 
-// Event tracking (optional)
-struct EventRecord
+// Delay hook statistics tracking
+struct HookStats
 {
-    int64_t t_ns;
-    uint32_t node;
-    std::string event;
-    uint32_t seq;
-    uint32_t len;
+    uint64_t totalPackets = 0;
+    uint64_t totalDelayNs = 0;
+    uint64_t maxDelayNs = 0;
 };
 
-static std::vector<EventRecord> g_eventRecords;
+static std::map<uint32_t, HookStats> g_egressStats;
+static std::map<uint32_t, HookStats> g_ingressStats;
 
 // ============================================================================
 // Utility Functions
@@ -112,9 +105,8 @@ GenerateRunId()
 
     // Add short hash based on config
     uint32_t hash = g_config.seed;
-    hash ^= std::hash<std::string>{}(g_config.workload);
-    hash ^= g_config.outstanding * 31;
-    hash ^= g_config.reqBytes * 37;
+    hash ^= g_config.duration * 31;
+    hash ^= g_config.numFlows * 17;
 
     oss << "-" << std::hex << std::setw(6) << std::setfill('0') << (hash & 0xFFFFFF);
 
@@ -132,98 +124,9 @@ CreateDirectories(const std::string& path)
     }
 }
 
-double
-Percentile(std::vector<int64_t>& data, double p)
-{
-    if (data.empty()) return 0.0;
-
-    std::sort(data.begin(), data.end());
-    size_t idx = static_cast<size_t>(p * data.size());
-    if (idx >= data.size()) idx = data.size() - 1;
-
-    return static_cast<double>(data[idx]);
-}
-
 // ============================================================================
 // Logging Functions
 // ============================================================================
-
-void
-LogRpcRecord(uint32_t seq, int64_t t_send_ns, int64_t t_recv_ns)
-{
-    RpcRecord rec;
-    rec.seq = seq;
-    rec.t_send_ns = t_send_ns;
-    rec.t_recv_ns = t_recv_ns;
-    rec.lat_ns = t_recv_ns - t_send_ns;
-
-    g_rpcRecords.push_back(rec);
-    g_completedRequests++;
-}
-
-void
-LogEvent(int64_t t_ns, uint32_t node, const std::string& event, uint32_t seq, uint32_t len)
-{
-    EventRecord rec;
-    rec.t_ns = t_ns;
-    rec.node = node;
-    rec.event = event;
-    rec.seq = seq;
-    rec.len = len;
-
-    g_eventRecords.push_back(rec);
-}
-
-void
-WriteRpcLog()
-{
-    std::string path = g_config.fullOutDir + "/rpc.jsonl";
-    std::ofstream ofs(path);
-
-    if (!ofs.is_open())
-    {
-        NS_LOG_ERROR("Failed to open rpc.jsonl for writing");
-        return;
-    }
-
-    for (const auto& rec : g_rpcRecords)
-    {
-        ofs << "{\"seq\":" << rec.seq
-            << ",\"t_send_ns\":" << rec.t_send_ns
-            << ",\"t_recv_ns\":" << rec.t_recv_ns
-            << ",\"lat_ns\":" << rec.lat_ns
-            << "}\n";
-    }
-
-    ofs.close();
-    NS_LOG_INFO("Wrote " << g_rpcRecords.size() << " RPC records to rpc.jsonl");
-}
-
-void
-WriteEventLog()
-{
-    std::string path = g_config.fullOutDir + "/events.jsonl";
-    std::ofstream ofs(path);
-
-    if (!ofs.is_open())
-    {
-        NS_LOG_ERROR("Failed to open events.jsonl for writing");
-        return;
-    }
-
-    for (const auto& rec : g_eventRecords)
-    {
-        ofs << "{\"t_ns\":" << rec.t_ns
-            << ",\"node\":" << rec.node
-            << ",\"event\":\"" << rec.event << "\""
-            << ",\"seq\":" << rec.seq
-            << ",\"len\":" << rec.len
-            << "}\n";
-    }
-
-    ofs.close();
-    NS_LOG_INFO("Wrote " << g_eventRecords.size() << " event records to events.jsonl");
-}
 
 void
 WriteConfigLog()
@@ -241,14 +144,10 @@ WriteConfigLog()
     ofs << "  \"linkRate\": \"" << g_config.linkRate << "\",\n";
     ofs << "  \"linkDelay\": \"" << g_config.linkDelay << "\",\n";
     ofs << "  \"mtu\": " << g_config.mtu << ",\n";
-    ofs << "  \"qdisc\": \"" << g_config.qdisc << "\",\n";
-    ofs << "  \"transport\": \"" << g_config.transport << "\",\n";
     ofs << "  \"tcpVariant\": \"" << g_config.tcpVariant << "\",\n";
-    ofs << "  \"workload\": \"" << g_config.workload << "\",\n";
-    ofs << "  \"nReq\": " << g_config.nReq << ",\n";
-    ofs << "  \"outstanding\": " << g_config.outstanding << ",\n";
-    ofs << "  \"reqBytes\": " << g_config.reqBytes << ",\n";
-    ofs << "  \"rspBytes\": " << g_config.rspBytes << ",\n";
+    ofs << "  \"duration\": " << g_config.duration << ",\n";
+    ofs << "  \"numFlows\": " << g_config.numFlows << ",\n";
+    ofs << "  \"maxBytesPerFlow\": " << g_config.maxBytes << ",\n";
     ofs << "  \"enableEgressHook\": " << (g_config.enableEgressHook ? "true" : "false") << ",\n";
     ofs << "  \"enableIngressHook\": " << (g_config.enableIngressHook ? "true" : "false") << ",\n";
     ofs << "  \"hookConfigPath\": \"" << g_config.hookConfigPath << "\",\n";
@@ -273,407 +172,233 @@ WriteSummary()
         return;
     }
 
-    // Calculate statistics
-    std::vector<int64_t> latencies;
-    for (const auto& rec : g_rpcRecords)
-    {
-        latencies.push_back(rec.lat_ns);
-    }
-
-    double p50 = Percentile(latencies, 0.50);
-    double p95 = Percentile(latencies, 0.95);
-    double p99 = Percentile(latencies, 0.99);
-
-    ofs << "CS538 Host Delay Experiment - Summary\n";
-    ofs << "======================================\n\n";
+    ofs << "CS538 iperf3 Experiment - Summary\n";
+    ofs << "===================================================\n\n";
 
     ofs << "Run ID: " << g_config.runId << "\n\n";
 
     ofs << "Configuration:\n";
     ofs << "--------------\n";
-    ofs << "Workload:        " << g_config.workload << "\n";
-    ofs << "Outstanding:     " << g_config.outstanding << "\n";
-    ofs << "Request size:    " << g_config.reqBytes << " bytes\n";
-    ofs << "Response size:   " << g_config.rspBytes << " bytes\n";
+    ofs << "TCP variant:     " << g_config.tcpVariant << "\n";
+    ofs << "Duration:        " << g_config.duration << " seconds\n";
+    ofs << "Number of flows: " << g_config.numFlows << "\n";
+    ofs << "Max bytes/flow:  " << (g_config.maxBytes == 0 ? "unlimited" : std::to_string(g_config.maxBytes)) << "\n";
     ofs << "Link rate:       " << g_config.linkRate << "\n";
     ofs << "Link delay:      " << g_config.linkDelay << "\n";
-    ofs << "MTU:             " << g_config.mtu << "\n";
-    ofs << "Qdisc:           " << g_config.qdisc << "\n";
-    ofs << "Transport:       " << g_config.transport << "\n";
-    if (g_config.transport == "tcp")
-    {
-        ofs << "TCP variant:     " << g_config.tcpVariant << "\n";
-    }
+    ofs << "MTU:             " << g_config.mtu << " bytes\n";
+    ofs << "Socket buffers:  1 MB (fixed)\n";
     ofs << "Egress hook:     " << (g_config.enableEgressHook ? "enabled" : "disabled") << "\n";
     ofs << "Ingress hook:    " << (g_config.enableIngressHook ? "enabled" : "disabled") << "\n";
-    ofs << "PCAP enabled:    " << (g_config.enablePcap ? "yes" : "no") << "\n";
+    ofs << "PCAP enabled:    " << (g_config.enablePcap ? "yes (client only)" : "no") << "\n";
     ofs << "Seed:            " << g_config.seed << "\n\n";
 
-    ofs << "Results:\n";
-    ofs << "--------\n";
-    ofs << "Total requests:  " << g_config.nReq << "\n";
-    ofs << "Completed:       " << g_completedRequests << "\n";
-    ofs << "Loss:            " << (g_config.nReq - g_completedRequests) << "\n\n";
+    // Per-flow statistics
+    uint64_t totalTxBytes = 0;
+    uint64_t totalRxBytes = 0;
+    uint64_t totalTxPackets = 0;
+    uint64_t totalRxPackets = 0;
 
-    ofs << "Latency (ns):\n";
-    ofs << "  p50:           " << std::fixed << std::setprecision(0) << p50 << "\n";
-    ofs << "  p95:           " << std::fixed << std::setprecision(0) << p95 << "\n";
-    ofs << "  p99:           " << std::fixed << std::setprecision(0) << p99 << "\n\n";
+    ofs << "Per-Flow Results:\n";
+    ofs << "-----------------\n";
+    for (size_t i = 0; i < g_flowStats.size(); i++)
+    {
+        const FlowStats& fs = g_flowStats[i];
+        double duration = fs.endTime - fs.startTime;
+        double throughputMbps = (fs.rxBytes * 8.0) / (duration * 1e6);
 
-    ofs << "Latency (μs):\n";
-    ofs << "  p50:           " << std::fixed << std::setprecision(2) << (p50 / 1000.0) << "\n";
-    ofs << "  p95:           " << std::fixed << std::setprecision(2) << (p95 / 1000.0) << "\n";
-    ofs << "  p99:           " << std::fixed << std::setprecision(2) << (p99 / 1000.0) << "\n";
+        ofs << "\nFlow " << i << " (port " << (5201 + i) << "):\n";
+        ofs << "  Duration:   " << std::fixed << std::setprecision(3) << duration << " seconds\n";
+        ofs << "  TX bytes:   " << fs.txBytes << "\n";
+        ofs << "  RX bytes:   " << fs.rxBytes << "\n";
+        ofs << "  TX packets: " << fs.txPackets << "\n";
+        ofs << "  RX packets: " << fs.rxPackets << "\n";
+        ofs << "  Throughput: " << std::fixed << std::setprecision(2) << throughputMbps << " Mbps";
+        ofs << " (" << (throughputMbps / 1000.0) << " Gbps)\n";
+
+        if (fs.txPackets > 0)
+        {
+            double lossRate = 100.0 * (1.0 - (double)fs.rxPackets / fs.txPackets);
+            ofs << "  Loss rate:  " << std::fixed << std::setprecision(4) << lossRate << " %\n";
+        }
+
+        totalTxBytes += fs.txBytes;
+        totalRxBytes += fs.rxBytes;
+        totalTxPackets += fs.txPackets;
+        totalRxPackets += fs.rxPackets;
+    }
+
+    // Aggregate statistics
+    double avgDuration = 0.0;
+    for (const auto& fs : g_flowStats)
+    {
+        avgDuration += (fs.endTime - fs.startTime);
+    }
+    avgDuration /= g_flowStats.size();
+
+    double totalThroughputMbps = (totalRxBytes * 8.0) / (avgDuration * 1e6);
+
+    ofs << "\n\nAggregate Results:\n";
+    ofs << "------------------\n";
+    ofs << "Total TX bytes:      " << totalTxBytes << "\n";
+    ofs << "Total RX bytes:      " << totalRxBytes << "\n";
+    ofs << "Total TX packets:    " << totalTxPackets << "\n";
+    ofs << "Total RX packets:    " << totalRxPackets << "\n";
+    ofs << "Aggregate throughput: " << std::fixed << std::setprecision(2) << totalThroughputMbps << " Mbps";
+    ofs << " (" << (totalThroughputMbps / 1000.0) << " Gbps)\n";
+
+    if (totalTxPackets > 0)
+    {
+        double overallLossRate = 100.0 * (1.0 - (double)totalRxPackets / totalTxPackets);
+        ofs << "Overall loss rate:    " << std::fixed << std::setprecision(4) << overallLossRate << " %\n";
+    }
+
+    // Delay hook statistics
+    if (g_config.enableEgressHook || g_config.enableIngressHook)
+    {
+        ofs << "\n\nDelay Hook Statistics:\n";
+        ofs << "----------------------\n";
+
+        if (g_config.enableEgressHook)
+        {
+            ofs << "\nEgress Hook (MacTx - before NIC transmission):\n";
+            for (const auto& entry : g_egressStats)
+            {
+                uint32_t nodeId = entry.first;
+                const HookStats& stats = entry.second;
+                if (stats.totalPackets > 0)
+                {
+                    double avgDelayUs = (double)stats.totalDelayNs / stats.totalPackets / 1000.0;
+                    double maxDelayUs = (double)stats.maxDelayNs / 1000.0;
+                    ofs << "  Node " << nodeId << ":\n";
+                    ofs << "    Packets processed: " << stats.totalPackets << "\n";
+                    ofs << "    Avg calculated delay: " << std::fixed << std::setprecision(3)
+                        << avgDelayUs << " us\n";
+                    ofs << "    Max calculated delay: " << std::fixed << std::setprecision(3)
+                        << maxDelayUs << " us\n";
+                }
+            }
+        }
+
+        if (g_config.enableIngressHook)
+        {
+            ofs << "\nIngress Hook (MacRx - before L3 delivery):\n";
+            for (const auto& entry : g_ingressStats)
+            {
+                uint32_t nodeId = entry.first;
+                const HookStats& stats = entry.second;
+                if (stats.totalPackets > 0)
+                {
+                    double avgDelayUs = (double)stats.totalDelayNs / stats.totalPackets / 1000.0;
+                    double maxDelayUs = (double)stats.maxDelayNs / 1000.0;
+                    ofs << "  Node " << nodeId << ":\n";
+                    ofs << "    Packets processed: " << stats.totalPackets << "\n";
+                    ofs << "    Avg calculated delay: " << std::fixed << std::setprecision(3)
+                        << avgDelayUs << " us\n";
+                    ofs << "    Max calculated delay: " << std::fixed << std::setprecision(3)
+                        << maxDelayUs << " us\n";
+                }
+            }
+        }
+
+        ofs << "\nNOTE: Delay injection implementation using DelayedPointToPointChannel.\n";
+        ofs << "Egress delays are injected at the channel level during packet transmission.\n";
+        ofs << "Statistics above show the delays calculated and applied to each packet.\n";
+    }
 
     ofs.close();
     NS_LOG_INFO("Wrote summary to summary.txt");
 
     // Also print to console
     std::cout << "\n=== Summary ===\n";
-    std::cout << "Completed: " << g_completedRequests << "/" << g_config.nReq << "\n";
-    std::cout << "p50: " << std::fixed << std::setprecision(2) << (p50 / 1000.0) << " μs\n";
-    std::cout << "p95: " << std::fixed << std::setprecision(2) << (p95 / 1000.0) << " μs\n";
-    std::cout << "p99: " << std::fixed << std::setprecision(2) << (p99 / 1000.0) << " μs\n";
-    
+    std::cout << "Flows: " << g_config.numFlows << "\n";
+    std::cout << "Aggregate throughput: " << std::fixed << std::setprecision(2) << totalThroughputMbps << " Mbps";
+    std::cout << " (" << (totalThroughputMbps / 1000.0) << " Gbps)\n";
+    std::cout << "Total TX/RX bytes: " << totalTxBytes << " / " << totalRxBytes << "\n";
+    std::cout << "Total TX/RX packets: " << totalTxPackets << " / " << totalRxPackets << "\n";
+
     if (g_config.enablePcap)
     {
-        std::cout << "\nPCAP file written to: " << g_config.fullOutDir << "/hd_runner-host0.pcap\n";
+        std::cout << "\nPCAP file written to: " << g_config.fullOutDir << "\n";
+        std::cout << "  - iperf3_" << g_config.tcpVariant << "-client.pcap (client interface)\n";
     }
 }
 
 // ============================================================================
-// Custom RPC Application
+// Delay Hook Callbacks
 // ============================================================================
 
-class RpcClientApp : public Application
-{
-public:
-    RpcClientApp();
-    virtual ~RpcClientApp();
-
-    void Setup(Address serverAddress,
-               uint16_t port,
-               uint32_t nReq,
-               uint32_t outstanding,
-               uint32_t reqSize,
-               uint32_t rspSize);
-
-private:
-    virtual void StartApplication() override;
-    virtual void StopApplication() override;
-
-    void SendRequest();
-    void HandleResponse(Ptr<Socket> socket);
-    void ApplyEgressHook(uint32_t seq, uint32_t bytes);
-
-    Ptr<Socket> m_socket;
-    Address m_serverAddress;
-    uint16_t m_port;
-    uint32_t m_nReq;
-    uint32_t m_outstanding;
-    uint32_t m_reqSize;
-    uint32_t m_rspSize;
-
-    uint32_t m_sent;
-    uint32_t m_received;
-    uint32_t m_inFlight;
-
-    std::map<uint32_t, int64_t> m_sendTimes;
-};
-
-RpcClientApp::RpcClientApp()
-    : m_socket(nullptr),
-      m_port(0),
-      m_nReq(0),
-      m_outstanding(1),
-      m_reqSize(1024),
-      m_rspSize(1024),
-      m_sent(0),
-      m_received(0),
-      m_inFlight(0)
-{
-}
-
-RpcClientApp::~RpcClientApp()
-{
-    m_socket = nullptr;
-}
+// Per-node sequence counters for hook tracking
+static std::map<uint32_t, uint32_t> g_egressSeq;
+static std::map<uint32_t, uint32_t> g_ingressSeq;
 
 void
-RpcClientApp::Setup(Address serverAddress,
-                    uint16_t port,
-                    uint32_t nReq,
-                    uint32_t outstanding,
-                    uint32_t reqSize,
-                    uint32_t rspSize)
+EgressTraceCallback(uint32_t nodeId, Ptr<const Packet> packet)
 {
-    m_serverAddress = serverAddress;
-    m_port = port;
-    m_nReq = nReq;
-    m_outstanding = outstanding;
-    m_reqSize = reqSize;
-    m_rspSize = rspSize;
-}
-
-void
-RpcClientApp::StartApplication()
-{
-    if (!m_socket)
-    {
-        // Select socket factory based on transport type
-        TypeId tid;
-        if (g_config.transport == "tcp")
-        {
-            tid = TypeId::LookupByName("ns3::TcpSocketFactory");
-        }
-        else
-        {
-            tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-        }
-
-        m_socket = Socket::CreateSocket(GetNode(), tid);
-
-        InetSocketAddress remote = InetSocketAddress(Ipv4Address::ConvertFrom(m_serverAddress), m_port);
-        m_socket->Connect(remote);
-        m_socket->SetRecvCallback(MakeCallback(&RpcClientApp::HandleResponse, this));
-    }
-
-    // Send initial batch of requests
-    for (uint32_t i = 0; i < m_outstanding && m_sent < m_nReq; ++i)
-    {
-        SendRequest();
-    }
-}
-
-void
-RpcClientApp::StopApplication()
-{
-    if (m_socket)
-    {
-        m_socket->Close();
-        m_socket->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
-    }
-}
-
-void
-RpcClientApp::ApplyEgressHook(uint32_t seq, uint32_t bytes)
-{
-    if (DelayHooks::IsEgressEnabled())
-    {
-        Time delay = DelayHooks::DelayEgress(GetNode()->GetId(), bytes, seq);
-        if (delay.GetNanoSeconds() > 0)
-        {
-            Simulator::Schedule(delay, &RpcClientApp::SendRequest, this);
-            return;
-        }
-    }
-}
-
-void
-RpcClientApp::SendRequest()
-{
-    if (m_sent >= m_nReq || m_inFlight >= m_outstanding)
-    {
+    if (!DelayHooks::IsEgressEnabled())
         return;
+
+    uint32_t seq = g_egressSeq[nodeId]++;
+    uint32_t bytes = packet->GetSize();
+    Time delay = DelayHooks::DelayEgress(nodeId, bytes, seq);
+
+    // Track statistics
+    g_egressStats[nodeId].totalPackets++;
+    g_egressStats[nodeId].totalDelayNs += delay.GetNanoSeconds();
+    if (delay.GetNanoSeconds() > g_egressStats[nodeId].maxDelayNs)
+    {
+        g_egressStats[nodeId].maxDelayNs = delay.GetNanoSeconds();
     }
 
-    uint32_t seq = m_sent++;
-    m_inFlight++;
-
-    // Create packet with sequence number in payload
-    Ptr<Packet> packet = Create<Packet>(m_reqSize);
-
-    // Record send time
-    int64_t now_ns = Simulator::Now().GetNanoSeconds();
-    m_sendTimes[seq] = now_ns;
-
-    // Log event
-    LogEvent(now_ns, GetNode()->GetId(), "tx_app", seq, m_reqSize);
-
-    // Apply egress hook
-    Time egressDelay = DelayHooks::DelayEgress(GetNode()->GetId(), m_reqSize, seq);
-    if (egressDelay.GetNanoSeconds() > 0)
+    // Log if delay is non-zero
+    if (delay.GetNanoSeconds() > 0)
     {
-        Simulator::Schedule(egressDelay, [this, packet, seq]() {
-            LogEvent(Simulator::Now().GetNanoSeconds(), GetNode()->GetId(), "tx_post_egress", seq, m_reqSize);
-            m_socket->Send(packet);
-        });
-    }
-    else
-    {
-        LogEvent(now_ns, GetNode()->GetId(), "tx_post_egress", seq, m_reqSize);
-        m_socket->Send(packet);
+        NS_LOG_DEBUG("Egress hook: node=" << nodeId << " seq=" << seq << " bytes=" << bytes
+                                          << " delay=" << delay.GetMicroSeconds() << "us");
     }
 }
 
 void
-RpcClientApp::HandleResponse(Ptr<Socket> socket)
+IngressTraceCallback(uint32_t nodeId, Ptr<const Packet> packet)
 {
-    Ptr<Packet> packet;
-    while ((packet = socket->Recv()))
+    if (!DelayHooks::IsIngressEnabled())
+        return;
+
+    uint32_t seq = g_ingressSeq[nodeId]++;
+    uint32_t bytes = packet->GetSize();
+    Time delay = DelayHooks::DelayIngress(nodeId, bytes, seq);
+
+    // Track statistics
+    g_ingressStats[nodeId].totalPackets++;
+    g_ingressStats[nodeId].totalDelayNs += delay.GetNanoSeconds();
+    if (delay.GetNanoSeconds() > g_ingressStats[nodeId].maxDelayNs)
     {
-        uint32_t seq = m_received++;
-        m_inFlight--;
+        g_ingressStats[nodeId].maxDelayNs = delay.GetNanoSeconds();
+    }
 
-        int64_t now_ns = Simulator::Now().GetNanoSeconds();
-
-        // Apply ingress hook
-        Time ingressDelay = DelayHooks::DelayIngress(GetNode()->GetId(), packet->GetSize(), seq);
-
-        int64_t recv_ns = now_ns + ingressDelay.GetNanoSeconds();
-
-        LogEvent(now_ns, GetNode()->GetId(), "rx_nic", seq, packet->GetSize());
-        LogEvent(recv_ns, GetNode()->GetId(), "rx_post_ingress", seq, packet->GetSize());
-
-        // Log RPC completion
-        if (m_sendTimes.find(seq) != m_sendTimes.end())
-        {
-            LogRpcRecord(seq, m_sendTimes[seq], recv_ns);
-            m_sendTimes.erase(seq);
-        }
-
-        // Send next request if we haven't reached limit
-        if (m_sent < m_nReq)
-        {
-            SendRequest();
-        }
-
-        // Check if we're done
-        if (m_received >= m_nReq)
-        {
-            Simulator::Stop();
-        }
+    // Log if delay is non-zero
+    if (delay.GetNanoSeconds() > 0)
+    {
+        NS_LOG_DEBUG("Ingress hook: node=" << nodeId << " seq=" << seq << " bytes=" << bytes
+                                           << " delay=" << delay.GetMicroSeconds() << "us");
     }
 }
 
 // ============================================================================
-// Simple RPC Server Application
+// Flow Monitor Callbacks
 // ============================================================================
 
-class RpcServerApp : public Application
+void
+TxTrace(uint32_t flowId, Ptr<const Packet> packet)
 {
-public:
-    RpcServerApp();
-    virtual ~RpcServerApp();
-
-    void Setup(uint16_t port, uint32_t rspSize);
-
-private:
-    virtual void StartApplication() override;
-    virtual void StopApplication() override;
-
-    void HandleRequest(Ptr<Socket> socket);
-    void HandleAccept(Ptr<Socket> socket, const Address& from);
-
-    Ptr<Socket> m_socket;
-    std::vector<Ptr<Socket>> m_acceptedSockets;  // For TCP connections
-    uint16_t m_port;
-    uint32_t m_rspSize;
-};
-
-RpcServerApp::RpcServerApp()
-    : m_socket(nullptr),
-      m_port(0),
-      m_rspSize(1024)
-{
-}
-
-RpcServerApp::~RpcServerApp()
-{
-    m_socket = nullptr;
+    g_flowStats[flowId].txBytes += packet->GetSize();
+    g_flowStats[flowId].txPackets++;
 }
 
 void
-RpcServerApp::Setup(uint16_t port, uint32_t rspSize)
+RxTrace(uint32_t flowId, Ptr<const Packet> packet, const Address& address)
 {
-    m_port = port;
-    m_rspSize = rspSize;
-}
-
-void
-RpcServerApp::StartApplication()
-{
-    if (!m_socket)
-    {
-        // Select socket factory based on transport type
-        TypeId tid;
-        if (g_config.transport == "tcp")
-        {
-            tid = TypeId::LookupByName("ns3::TcpSocketFactory");
-            m_socket = Socket::CreateSocket(GetNode(), tid);
-            InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
-            m_socket->Bind(local);
-            m_socket->Listen();
-            m_socket->SetAcceptCallback(
-                MakeNullCallback<bool, Ptr<Socket>, const Address&>(),
-                MakeCallback(&RpcServerApp::HandleAccept, this));
-        }
-        else
-        {
-            tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-            m_socket = Socket::CreateSocket(GetNode(), tid);
-            InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
-            m_socket->Bind(local);
-            m_socket->SetRecvCallback(MakeCallback(&RpcServerApp::HandleRequest, this));
-        }
-    }
-}
-
-void
-RpcServerApp::StopApplication()
-{
-    if (m_socket)
-    {
-        m_socket->Close();
-        m_socket->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
-    }
-
-    // Close all accepted TCP sockets
-    for (auto& sock : m_acceptedSockets)
-    {
-        if (sock)
-        {
-            sock->Close();
-            sock->SetRecvCallback(MakeNullCallback<void, Ptr<Socket>>());
-        }
-    }
-    m_acceptedSockets.clear();
-}
-
-void
-RpcServerApp::HandleAccept(Ptr<Socket> socket, const Address& from)
-{
-    // Handle new TCP connection
-    socket->SetRecvCallback(MakeCallback(&RpcServerApp::HandleRequest, this));
-    m_acceptedSockets.push_back(socket);
-}
-
-void
-RpcServerApp::HandleRequest(Ptr<Socket> socket)
-{
-    Ptr<Packet> packet;
-
-    if (g_config.transport == "tcp")
-    {
-        // For TCP, use Recv() instead of RecvFrom()
-        while ((packet = socket->Recv()))
-        {
-            // Immediately send response
-            Ptr<Packet> response = Create<Packet>(m_rspSize);
-            socket->Send(response);
-        }
-    }
-    else
-    {
-        // For UDP, use RecvFrom()
-        Address from;
-        while ((packet = socket->RecvFrom(from)))
-        {
-            // Immediately send response
-            Ptr<Packet> response = Create<Packet>(m_rspSize);
-            socket->SendTo(response, 0, from);
-        }
-    }
+    g_flowStats[flowId].rxBytes += packet->GetSize();
+    g_flowStats[flowId].rxPackets++;
 }
 
 // ============================================================================
@@ -681,22 +406,23 @@ RpcServerApp::HandleRequest(Ptr<Socket> socket)
 // ============================================================================
 
 void
-SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces, NetDeviceContainer& allDevices)
+SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces)
 {
-    NS_LOG_INFO("Setting up Host0 → Switch → Host1 topology");
+    NS_LOG_INFO("Setting up Host0 (server) - Switch - Host1 (client) topology for iperf3");
+    NS_LOG_INFO("Using DelayedPointToPointChannel for delay injection");
 
-    // Create 3 nodes: Host0, Switch, Host1
+    // Create 3 nodes: Host0 (server), Switch, Host1 (client)
     NodeContainer allNodes;
     allNodes.Create(3);
     Ptr<Node> host0 = allNodes.Get(0);
     Ptr<Node> switchNode = allNodes.Get(1);
     Ptr<Node> host1 = allNodes.Get(2);
 
-    hosts.Add(host0);  // Host0
-    hosts.Add(host1);  // Host1
+    hosts.Add(host0);  // Host0 - iperf3 server
+    hosts.Add(host1);  // Host1 - iperf3 client
 
-    // Configure point-to-point links
-    PointToPointHelper p2p;
+    // Configure custom point-to-point links with delay injection
+    PointToPointHelperCustom p2p;
     p2p.SetDeviceAttribute("DataRate", StringValue(g_config.linkRate));
     p2p.SetChannelAttribute("Delay", StringValue(g_config.linkDelay));
     p2p.SetDeviceAttribute("Mtu", UintegerValue(g_config.mtu));
@@ -713,29 +439,25 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces, NetDevic
     link1.Add(host1);
     NetDeviceContainer devices1 = p2p.Install(link1);
 
-    // Store all devices for PCAP capture
-    allDevices.Add(devices0);
-    allDevices.Add(devices1);
-
-    // Install Internet stack on all nodes
+    // Install Internet stack with TCP configuration
     InternetStackHelper stack;
 
-    // Configure TCP variant if using TCP
-    if (g_config.transport == "tcp")
-    {
-        Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue("ns3::" + g_config.tcpVariant));
-        // Enable ECN for DCTCP
-        if (g_config.tcpVariant == "TcpDctcp")
-        {
-            Config::SetDefault("ns3::TcpSocketBase::UseEcn", StringValue("On"));
-            Config::SetDefault("ns3::RedQueueDisc::UseEcn", BooleanValue(true));
-            Config::SetDefault("ns3::RedQueueDisc::UseHardDrop", BooleanValue(false));
-            Config::SetDefault("ns3::RedQueueDisc::MeanPktSize", UintegerValue(1500));
-            Config::SetDefault("ns3::RedQueueDisc::QW", DoubleValue(1.0));
-            Config::SetDefault("ns3::RedQueueDisc::MinTh", DoubleValue(20));
-            Config::SetDefault("ns3::RedQueueDisc::MaxTh", DoubleValue(60));
-        }
-    }
+    // Configure TCP variant
+    std::string transport_prot = std::string("ns3::") + g_config.tcpVariant;
+    Config::SetDefault("ns3::TcpL4Protocol::SocketType", TypeIdValue(TypeId::LookupByName(transport_prot)));
+
+    // TCP buffer sizes - 1 MB (fixed, no auto-tuning)
+    Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(1 << 20)); // 1MB
+    Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(1 << 20)); // 1MB
+    Config::SetDefault("ns3::TcpSocketState::EnablePacing", BooleanValue(false)); // Disable pacing
+    Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(g_config.mtu - 52)); // MTU - headers
+    Config::SetDefault("ns3::TcpSocketBase::WindowScaling", BooleanValue(true)); // Enable window scaling
+
+    Config::SetDefault("ns3::TcpSocketBase::MinRto", TimeValue(Seconds(0.2))); // Min RTO
+    Config::SetDefault("ns3::TcpSocketBase::Timestamp", BooleanValue(true)); // Enable timestamps
+
+    // Initial congestion window
+    Config::SetDefault("ns3::TcpSocket::InitialCwnd", UintegerValue(10));
 
     stack.Install(allNodes);
 
@@ -743,25 +465,24 @@ SetupTopology(NodeContainer& hosts, Ipv4InterfaceContainer& interfaces, NetDevic
     Ipv4AddressHelper address;
 
     // Subnet for Host0 ↔ Switch
-    address.SetBase("10.1.1.0", "255.255.255.0");
+    address.SetBase("10.10.1.0", "255.255.255.0");
     Ipv4InterfaceContainer interfaces0 = address.Assign(devices0);
 
     // Subnet for Switch ↔ Host1
-    address.SetBase("10.1.2.0", "255.255.255.0");
+    address.SetBase("10.10.2.0", "255.255.255.0");
     Ipv4InterfaceContainer interfaces1 = address.Assign(devices1);
 
     // Enable global routing
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-    // Store host interfaces for application setup
-    // interfaces container will have Host0's address and Host1's address
-    interfaces.Add(interfaces0.Get(0));  // Host0: 10.1.1.1
-    interfaces.Add(interfaces1.Get(1));  // Host1: 10.1.2.2
+    // Store host interfaces
+    interfaces.Add(interfaces0.Get(0));  // Host0 (server): 10.10.1.1
+    interfaces.Add(interfaces1.Get(1));  // Host1 (client): 10.10.2.2
 
     NS_LOG_INFO("Topology setup complete");
-    NS_LOG_INFO("  Host0: " << interfaces.GetAddress(0));
-    NS_LOG_INFO("  Switch: 10.1.1.2 / 10.1.2.1");
-    NS_LOG_INFO("  Host1: " << interfaces.GetAddress(1));
+    NS_LOG_INFO("  Host0 (server): " << interfaces.GetAddress(0));
+    NS_LOG_INFO("  Switch: 10.10.1.2 / 10.10.2.1");
+    NS_LOG_INFO("  Host1 (client): " << interfaces.GetAddress(1));
 }
 
 // ============================================================================
@@ -779,13 +500,13 @@ EnablePcapCapture(const NodeContainer& hosts)
     NS_LOG_INFO("Enabling PCAP capture on client host");
 
     PointToPointHelper p2p;
-    std::string pcapPrefix = g_config.fullOutDir + "/hd_runner";
+    std::string pcapPrefix = g_config.fullOutDir + "/iperf3_" + g_config.tcpVariant + "-client.pcap";
 
-    // Capture on host0 (client) only - device 0
-    p2p.EnablePcap(pcapPrefix + "-host0", hosts.Get(0)->GetDevice(0), false);
+    // Capture only on host1 (client) - device 0
+    p2p.EnablePcap(pcapPrefix, hosts.Get(1)->GetDevice(0), false, true);
 
     NS_LOG_INFO("PCAP capture enabled on client interface");
-    NS_LOG_INFO("  File will be written to: " << pcapPrefix << "-host0.pcap");
+    NS_LOG_INFO("  File will be written to: " << pcapPrefix << ".pcap");
 }
 
 // ============================================================================
@@ -802,16 +523,12 @@ main(int argc, char* argv[])
     cmd.AddValue("linkRate", "Link data rate", g_config.linkRate);
     cmd.AddValue("linkDelay", "Link propagation delay", g_config.linkDelay);
     cmd.AddValue("mtu", "MTU size", g_config.mtu);
-    cmd.AddValue("qdisc", "Queue discipline (none|fq_codel)", g_config.qdisc);
-    cmd.AddValue("transport", "Transport protocol (udp|tcp)", g_config.transport);
-    cmd.AddValue("tcpVariant", "TCP variant (TcpNewReno|TcpDctcp|TcpCubic)", g_config.tcpVariant);
+    cmd.AddValue("tcpVariant", "TCP variant (TcpDctcp default)", g_config.tcpVariant);
 
-    // Workload parameters
-    cmd.AddValue("workload", "Workload type (pingpong|rpc)", g_config.workload);
-    cmd.AddValue("nReq", "Number of requests", g_config.nReq);
-    cmd.AddValue("outstanding", "Outstanding requests", g_config.outstanding);
-    cmd.AddValue("reqBytes", "Request size in bytes", g_config.reqBytes);
-    cmd.AddValue("rspBytes","Response size in bytes", g_config.rspBytes);
+    // iperf3 parameters
+    cmd.AddValue("duration", "Test duration in seconds", g_config.duration);
+    cmd.AddValue("numFlows", "Number of parallel flows", g_config.numFlows);
+    cmd.AddValue("maxBytes", "Max bytes to transmit per flow (0=unlimited)", g_config.maxBytes);
 
     // Hook parameters
     cmd.AddValue("enableEgressHook", "Enable egress hook", g_config.enableEgressHook);
@@ -824,7 +541,7 @@ main(int argc, char* argv[])
     cmd.AddValue("outDir", "Output directory", g_config.outDir);
 
     // PCAP parameters
-    cmd.AddValue("enablePcap", "Enable PCAP packet capture", g_config.enablePcap);
+    cmd.AddValue("enablePcap", "Enable PCAP packet capture (client only)", g_config.enablePcap);
 
     cmd.Parse(argc, argv);
 
@@ -842,7 +559,7 @@ main(int argc, char* argv[])
     g_config.fullOutDir = g_config.outDir + "/" + g_config.runId;
     CreateDirectories(g_config.fullOutDir);
 
-    NS_LOG_INFO("CS538 Host Delay Experiment Runner");
+    NS_LOG_INFO("CS538 iperf3 Experiment Runner");
     NS_LOG_INFO("Run ID: " << g_config.runId);
     NS_LOG_INFO("Output: " << g_config.fullOutDir);
 
@@ -855,54 +572,110 @@ main(int argc, char* argv[])
     // Setup topology
     NodeContainer hosts;
     Ipv4InterfaceContainer interfaces;
-    NetDeviceContainer allDevices;
-    SetupTopology(hosts, interfaces, allDevices);
+    SetupTopology(hosts, interfaces);
 
-    // Enable PCAP capture if requested (client-side only)
+    // Enable PCAP capture on client only
     EnablePcapCapture(hosts);
 
-    // Setup applications
-    uint16_t port = 9999;
+    // Connect delay hook traces to NetDevices for statistics tracking
+    // Note: Actual delay injection happens in DelayedPointToPointChannel
+    if (g_config.enableEgressHook || g_config.enableIngressHook)
+    {
+        NS_LOG_INFO("Connecting delay hook traces for statistics tracking");
+        NS_LOG_INFO("  (Actual egress delay injection happens in DelayedPointToPointChannel)");
+        for (uint32_t i = 0; i < hosts.GetN(); i++)
+        {
+            Ptr<Node> node = hosts.Get(i);
+            Ptr<NetDevice> device = node->GetDevice(0);
 
-    // Server on Host1
-    Ptr<RpcServerApp> serverApp = CreateObject<RpcServerApp>();
-    serverApp->Setup(port, g_config.rspBytes);
-    hosts.Get(1)->AddApplication(serverApp);
-    serverApp->SetStartTime(Seconds(0.0));
-    serverApp->SetStopTime(Seconds(1000.0));
+            if (g_config.enableEgressHook)
+            {
+                bool connected = device->TraceConnectWithoutContext(
+                    "MacTx", MakeBoundCallback(&EgressTraceCallback, i));
+                NS_LOG_INFO("  Node " << i << " egress stats trace: "
+                                      << (connected ? "connected" : "FAILED"));
+            }
 
-    // Client on Host0
-    Ptr<RpcClientApp> clientApp = CreateObject<RpcClientApp>();
-    clientApp->Setup(interfaces.GetAddress(1),
-                     port,
-                     g_config.nReq,
-                     g_config.outstanding,
-                     g_config.reqBytes,
-                     g_config.rspBytes);
-    hosts.Get(0)->AddApplication(clientApp);
-    clientApp->SetStartTime(Seconds(0.1));
-    clientApp->SetStopTime(Seconds(1000.0));
+            if (g_config.enableIngressHook)
+            {
+                bool connected = device->TraceConnectWithoutContext(
+                    "MacRx", MakeBoundCallback(&IngressTraceCallback, i));
+                NS_LOG_INFO("  Node " << i << " ingress stats trace: "
+                                      << (connected ? "connected" : "FAILED"));
+            }
+        }
+    }
 
-    NS_LOG_INFO("Starting simulation");
-    NS_LOG_INFO("  Workload: " << g_config.workload);
-    NS_LOG_INFO("  Requests: " << g_config.nReq);
-    NS_LOG_INFO("  Outstanding: " << g_config.outstanding);
-    NS_LOG_INFO("  Req/Rsp size: " << g_config.reqBytes << "/" << g_config.rspBytes);
+    // Initialize flow statistics
+    g_flowStats.resize(g_config.numFlows);
+
+    // Setup multiple iperf3-like flows (starting from port 5201)
+    uint16_t basePort = 5201;
+
+    NS_LOG_INFO("Setting up " << g_config.numFlows << " parallel iperf3 flows");
+
+    for (uint32_t i = 0; i < g_config.numFlows; i++)
+    {
+        uint16_t port = basePort + i;
+
+        // Server (sink) on Host0 (10.10.1.1)
+        PacketSinkHelper sinkHelper("ns3::TcpSocketFactory",
+                                    InetSocketAddress(Ipv4Address::GetAny(), port));
+        ApplicationContainer sinkApp = sinkHelper.Install(hosts.Get(0));
+        sinkApp.Start(Seconds(0.0));
+        sinkApp.Stop(Seconds(g_config.duration + 5.0));
+
+        // Client (bulk sender) on Host1 (10.10.2.2) -> connects to server at 10.10.1.1
+        BulkSendHelper bulkSendHelper("ns3::TcpSocketFactory",
+                                      InetSocketAddress(interfaces.GetAddress(0), port));
+        bulkSendHelper.SetAttribute("MaxBytes", UintegerValue(g_config.maxBytes)); // 0 = unlimited
+        bulkSendHelper.SetAttribute("SendSize", UintegerValue(g_config.mtu - 52)); // Segment size
+
+        ApplicationContainer clientApp = bulkSendHelper.Install(hosts.Get(1));
+        clientApp.Start(Seconds(0.5));
+        clientApp.Stop(Seconds(g_config.duration + 0.5));
+
+        // Record flow timing
+        g_flowStats[i].startTime = 0.5;
+        g_flowStats[i].endTime = g_config.duration + 0.5;
+
+        // Connect trace sources for per-flow statistics
+        Ptr<BulkSendApplication> bulkSend = DynamicCast<BulkSendApplication>(clientApp.Get(0));
+        Ptr<PacketSink> sink = DynamicCast<PacketSink>(sinkApp.Get(0));
+
+        if (bulkSend)
+        {
+            bulkSend->TraceConnectWithoutContext("Tx", MakeBoundCallback(&TxTrace, i));
+        }
+
+        if (sink)
+        {
+            sink->TraceConnectWithoutContext("Rx", MakeBoundCallback(&RxTrace, i));
+        }
+
+        NS_LOG_INFO("  Flow " << i << ": port " << port);
+    }
+
+    NS_LOG_INFO("Starting iperf3 simulation");
+    NS_LOG_INFO("  Flows: " << g_config.numFlows);
+    NS_LOG_INFO("  Duration: " << g_config.duration << " seconds");
+    NS_LOG_INFO("  Max bytes/flow: " << (g_config.maxBytes == 0 ? "unlimited" : std::to_string(g_config.maxBytes)));
+    NS_LOG_INFO("  MTU: " << g_config.mtu << " bytes (4K)");
+    NS_LOG_INFO("  Link rate: " << g_config.linkRate);
+    NS_LOG_INFO("  TCP variant: " << g_config.tcpVariant);
     if (g_config.enablePcap)
     {
         NS_LOG_INFO("  PCAP: enabled (client-side only)");
     }
 
     // Run simulation
-    Simulator::Stop(Seconds(60.0));  // Max 60s
+    Simulator::Stop(Seconds(g_config.duration + 10.0));
     Simulator::Run();
 
     NS_LOG_INFO("Simulation complete");
 
     // Write outputs
     WriteConfigLog();
-    WriteRpcLog();
-    WriteEventLog();
     WriteSummary();
 
     Simulator::Destroy();
