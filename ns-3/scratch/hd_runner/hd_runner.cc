@@ -3,13 +3,9 @@
  * CS538 Host Delay Experiment Runner
  *
  * A deterministic experiment harness using iperf3
- * Features:
  * - Deterministic Host0 → Switch → Host1 topology
  * - 4 parallel iperf3 flows
  * - Delay hooks (DelayEgress/DelayIngress)
- * - Per-flow latency logging (JSONL)
- * - Optional event timeline logging
- * - Summary statistics (p50/p95/p99)
  * - PCAP capture support (client-side only)
  */
 
