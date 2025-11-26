@@ -38,7 +38,7 @@ struct RunConfig
 {
     // Network parameters
     std::string linkRate = "100Gbps";  // 100 Gbps NICs
-    std::string linkDelay = "61.25us"; // 0.245ms / 4 (from ping RTT measurements)
+    std::string linkDelay = "26us"; // 0.105ms / 4 - 1
     uint32_t mtu = 4000;  // 4K MTU
     std::string tcpVariant = "TcpDctcp"; // Default to DCTCP
 
