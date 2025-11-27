@@ -45,7 +45,7 @@ struct RunConfig
     // iperf3 parameters
     uint32_t duration = 1;  // Test duration in seconds
     uint32_t numFlows = 4;   // Number of parallel flows
-    uint64_t maxBytes = 0;   // Max bytes per flow (0 = unlimited)
+    uint64_t maxBytes = 10000000;   // Max bytes per flow (10MB for tuning; 0 = unlimited)
 
     // Hook parameters
     bool enableEgressHook = false;

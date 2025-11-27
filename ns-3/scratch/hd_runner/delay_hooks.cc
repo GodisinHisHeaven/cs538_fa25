@@ -13,15 +13,16 @@
  */
 
 #include "delay_hooks.h"
+#include "ns3/double.h"
 #include "ns3/log.h"
+#include "ns3/random-variable-stream.h"
 #include "ns3/simulator.h"
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <deque>
-#include <map>
+#include <algorithm>
 #include <cmath>
-#include <random>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <sstream>
 
 namespace ns3 {
 
@@ -61,10 +62,18 @@ struct DelayModelConfig
         double queueGrowthFactor;
     } queue;
 
+    // Ingress-only additive delay to better match real hosts
+    struct {
+        uint32_t baseIngressNs;
+        uint32_t tailSlopeNs; // multiplied by load (capped) for tail lift
+    } ingress;
+
     // Load tracking
     struct {
         uint32_t windowSizeMs;
         double nominalRatePps;
+        double maxLoad;
+        double alpha;
     } loadTracking;
 };
 
@@ -78,20 +87,25 @@ static DelayModelConfig CreateRealisticConfig()
     config.cache.cacheLineSize = 64;
     config.cache.smallPacketThreshold = 256;
     config.cache.largePacketThreshold = 1024;
-    config.cache.missProbabilitySmall = 0.1;
-    config.cache.missProbabilityMedium = 0.4;
-    config.cache.missProbabilityLarge = 0.7;
+    config.cache.missProbabilitySmall = 0.02;
+    config.cache.missProbabilityMedium = 0.05;
+    config.cache.missProbabilityLarge = 0.10;
 
-    config.penalty.basePenaltyNs = 100;
+    config.penalty.basePenaltyNs = 20;
     config.penalty.loadThreshold = 0.7;
     config.penalty.highLoadMultiplier = 3.0;
 
-    config.queue.baseQueueNs = 50;
+    config.queue.baseQueueNs = 20;
     config.queue.loadThreshold = 0.6;
-    config.queue.queueGrowthFactor = 2.0;
+    config.queue.queueGrowthFactor = 1.0;
 
-    config.loadTracking.windowSizeMs = 100;
-    config.loadTracking.nominalRatePps = 10000.0;
+    config.ingress.baseIngressNs = 50000; // ~50us baseline host stack cost
+    config.ingress.tailSlopeNs = 0;       // disable tail for stability during tuning
+
+    config.loadTracking.windowSizeMs = 10;
+    config.loadTracking.nominalRatePps = 3000000.0; // ~100 Gbps at 4K MTU
+    config.loadTracking.maxLoad = 3.0;              // clamp load to avoid runaway
+    config.loadTracking.alpha = 0.05;               // smoother EWMA
 
     return config;
 }
@@ -114,12 +128,23 @@ static DelayModelConfig CreateSevereConfig()
 // Static State
 // ============================================================================
 
-// Per-node timestamp tracking for load calculation
-static std::map<uint32_t, std::deque<int64_t>> g_nodeTimestamps;
+struct LoadState
+{
+    double ewmaLoad = 0.0;
+    int64_t lastUpdateNs = 0;
+};
+
+// Per-node load tracking, split by direction
+static std::map<uint32_t, LoadState> g_egressLoad;
+static std::map<uint32_t, LoadState> g_ingressLoad;
 
 // Global configuration
 static DelayModelConfig g_config;
 static bool g_configInitialized = false;
+
+// Random variables
+static Ptr<UniformRandomVariable> g_cacheMissRv;
+static Ptr<NormalRandomVariable> g_baseJitterRv;
 
 // Static member initialization
 bool DelayHooks::s_egressEnabled = false;
@@ -165,8 +190,15 @@ static uint32_t CalculateCacheMisses(uint32_t bytes)
     uint32_t cacheLines = (bytes + g_config.cache.cacheLineSize - 1) /
                           g_config.cache.cacheLineSize;
 
-    // Apply probability to get expected cache misses
-    uint32_t cacheMisses = static_cast<uint32_t>(std::ceil(cacheLines * missProb));
+    // Sample cache misses probabilistically per cache line
+    uint32_t cacheMisses = 0;
+    for (uint32_t i = 0; i < cacheLines; i++)
+    {
+        if (g_cacheMissRv && g_cacheMissRv->GetValue() < missProb)
+        {
+            cacheMisses++;
+        }
+    }
 
     NS_LOG_DEBUG("CalculateCacheMisses: bytes=" << bytes
                  << " cacheLines=" << cacheLines
@@ -177,45 +209,50 @@ static uint32_t CalculateCacheMisses(uint32_t bytes)
 }
 
 /**
- * Calculate current load factor from rolling window of packet timestamps
- *
- * Load = (packets in window) / (window duration × nominal rate)
+ * Calculate current load factor using an EWMA that decays with idle time
  *
  * Returns load factor (0.0 = no load, 1.0 = nominal load, >1.0 = overload)
  */
-static double CalculateLoad(uint32_t nodeId, int64_t currentTimeNs)
+static double CalculateLoad(uint32_t nodeId, bool isEgress, int64_t currentTimeNs)
 {
     if (!g_configInitialized)
     {
         return 0.0;
     }
 
-    auto& timestamps = g_nodeTimestamps[nodeId];
+    auto& state = isEgress ? g_egressLoad[nodeId] : g_ingressLoad[nodeId];
 
-    // Remove expired timestamps (older than window)
+    // Decay existing load for long idle periods
     int64_t windowNs = static_cast<int64_t>(g_config.loadTracking.windowSizeMs) * 1000000LL;
-    int64_t cutoffTime = currentTimeNs - windowNs;
-
-    while (!timestamps.empty() && timestamps.front() < cutoffTime)
+    if (state.lastUpdateNs > 0 && currentTimeNs > state.lastUpdateNs)
     {
-        timestamps.pop_front();
+        int64_t deltaNs = currentTimeNs - state.lastUpdateNs;
+        double decay = std::exp(-static_cast<double>(deltaNs) / windowNs);
+        state.ewmaLoad *= decay;
     }
 
-    // Add current packet timestamp
-    timestamps.push_back(currentTimeNs);
+    // Compute instantaneous load from the gap since last packet
+    double instLoad = 0.0;
+    if (state.lastUpdateNs > 0 && currentTimeNs > state.lastUpdateNs)
+    {
+        double deltaNs = static_cast<double>(currentTimeNs - state.lastUpdateNs);
+        double instRatePps = 1e9 / deltaNs;
+        instLoad = instRatePps / g_config.loadTracking.nominalRatePps;
+        instLoad = std::min(instLoad, g_config.loadTracking.maxLoad);
+    }
 
-    // Calculate load
-    double packetsInWindow = static_cast<double>(timestamps.size());
-    double windowDurationS = static_cast<double>(windowNs) / 1e9;
-    double actualRate = packetsInWindow / windowDurationS;
-    double load = actualRate / g_config.loadTracking.nominalRatePps;
+    // EWMA update
+    double alpha = g_config.loadTracking.alpha;
+    state.ewmaLoad = (alpha * instLoad) + ((1.0 - alpha) * state.ewmaLoad);
+    state.ewmaLoad = std::min(state.ewmaLoad, g_config.loadTracking.maxLoad);
+    state.lastUpdateNs = currentTimeNs;
 
     NS_LOG_DEBUG("CalculateLoad: node=" << nodeId
-                 << " packetsInWindow=" << packetsInWindow
-                 << " actualRate=" << actualRate
-                 << " load=" << load);
+                 << " dir=" << (isEgress ? "egress" : "ingress")
+                 << " instLoad=" << instLoad
+                 << " ewma=" << state.ewmaLoad);
 
-    return load;
+    return state.ewmaLoad;
 }
 
 /**
@@ -233,20 +270,14 @@ static uint32_t CalculatePenalty(double load)
         return 0;
     }
 
-    uint32_t penalty = g_config.penalty.basePenaltyNs;
+    // Smooth growth to avoid discontinuities
+    double cappedLoad = std::min(load, g_config.loadTracking.maxLoad);
+    double multiplier = 1.0 + 0.5 * cappedLoad;
+    double penalty = static_cast<double>(g_config.penalty.basePenaltyNs) * multiplier;
 
-    if (load >= g_config.penalty.loadThreshold)
-    {
-        penalty = static_cast<uint32_t>(penalty * g_config.penalty.highLoadMultiplier);
-        NS_LOG_DEBUG("CalculatePenalty: HIGH LOAD - load=" << load
-                     << " threshold=" << g_config.penalty.loadThreshold
-                     << " penalty=" << penalty);
-    }
-    else
-    {
-        NS_LOG_DEBUG("CalculatePenalty: normal load - load=" << load
-                     << " penalty=" << penalty);
-    }
+    NS_LOG_DEBUG("CalculatePenalty: load=" << load
+                 << " multiplier=" << multiplier
+                 << " penalty=" << penalty);
 
     return static_cast<uint32_t>(penalty * g_config.severityMultiplier);
 }
@@ -266,14 +297,12 @@ static uint32_t CalculateQueueDelay(double load)
         return 0;
     }
 
-    uint32_t queueDelay = g_config.queue.baseQueueNs;
+    double queueDelay = g_config.queue.baseQueueNs;
 
     if (load >= g_config.queue.loadThreshold)
     {
         double excessLoad = load - g_config.queue.loadThreshold;
-        uint32_t additionalDelay = static_cast<uint32_t>(
-            g_config.queue.baseQueueNs * g_config.queue.queueGrowthFactor * excessLoad
-        );
+        double additionalDelay = g_config.queue.baseQueueNs * g_config.queue.queueGrowthFactor * excessLoad;
         queueDelay += additionalDelay;
 
         NS_LOG_DEBUG("CalculateQueueDelay: HIGH LOAD - load=" << load
@@ -325,8 +354,21 @@ void DelayHooks::Initialize(const std::string& configPath,
 
     g_configInitialized = true;
 
-    // Clear any existing timestamp data
-    g_nodeTimestamps.clear();
+    // Clear load tracking and initialize RNGs
+    g_egressLoad.clear();
+    g_ingressLoad.clear();
+
+    g_cacheMissRv = CreateObject<UniformRandomVariable>();
+    g_baseJitterRv = CreateObject<NormalRandomVariable>();
+    g_baseJitterRv->SetAttribute("Mean", DoubleValue(0.0));
+    g_baseJitterRv->SetAttribute("Variance", DoubleValue(50.0 * 50.0));
+
+    // Seed streams for repeatability across runs
+    if (seed != 0)
+    {
+        g_cacheMissRv->SetStream(seed + 1);
+        g_baseJitterRv->SetStream(seed + 2);
+    }
 
     NS_LOG_INFO("DelayHooks initialized:");
     NS_LOG_INFO("  Egress enabled: " << (enableEgress ? "yes" : "no"));
@@ -348,8 +390,8 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 
     int64_t nowNs = Simulator::Now().GetNanoSeconds();
 
-    // Calculate load factor
-    double load = CalculateLoad(nodeId, nowNs);
+    // Calculate load factor (egress only)
+    double load = CalculateLoad(nodeId, true, nowNs);
 
     // Calculate cache misses
     uint32_t cacheMisses = CalculateCacheMisses(bytes);
@@ -360,10 +402,28 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
     // Calculate queueing delay (load-dependent)
     uint32_t queueDelay = CalculateQueueDelay(load);
 
-    // Total delay = base + (misses × penalty) + queue
-    uint32_t totalDelayNs = g_config.baseCpuCyclesNs +
-                            (cacheMisses * penaltyPerMiss) +
-                            queueDelay;
+    // Ingress shaping to mimic host stack latency (only on ingress path)
+    double cappedLoad = std::min(load, g_config.loadTracking.maxLoad);
+    uint32_t ingressShapingNs = g_config.ingress.baseIngressNs +
+                                static_cast<uint32_t>(g_config.ingress.tailSlopeNs * cappedLoad);
+
+    // Add base jitter (clamped to zero)
+    uint32_t jitterNs = 0;
+    if (g_baseJitterRv)
+    {
+        double jitter = g_baseJitterRv->GetValue();
+        jitterNs = static_cast<uint32_t>(std::max<double>(0.0, std::lround(jitter)));
+    }
+
+    // Total delay = base + ingress shaping + jitter + (misses × penalty) + queue
+    uint64_t totalDelayNs = static_cast<uint64_t>(g_config.baseCpuCyclesNs) +
+                            static_cast<uint64_t>(ingressShapingNs) +
+                            static_cast<uint64_t>(jitterNs) +
+                            static_cast<uint64_t>(cacheMisses) * penaltyPerMiss +
+                            static_cast<uint64_t>(queueDelay);
+
+    // Cap to avoid pathological values
+    totalDelayNs = std::min<uint64_t>(totalDelayNs, 1000000000ULL); // 1 second cap
 
     NS_LOG_DEBUG("DelayEgress: node=" << nodeId
                  << " bytes=" << bytes
@@ -372,6 +432,8 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
                  << " misses=" << cacheMisses
                  << " penalty=" << penaltyPerMiss
                  << " queue=" << queueDelay
+                 << " ingressShape=" << ingressShapingNs
+                 << " jitter=" << jitterNs
                  << " totalDelay=" << totalDelayNs << "ns");
 
     return NanoSeconds(totalDelayNs);
@@ -386,8 +448,8 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 
     int64_t nowNs = Simulator::Now().GetNanoSeconds();
 
-    // Calculate load factor
-    double load = CalculateLoad(nodeId, nowNs);
+    // Calculate load factor (ingress only)
+    double load = CalculateLoad(nodeId, false, nowNs);
 
     // Calculate cache misses
     uint32_t cacheMisses = CalculateCacheMisses(bytes);
@@ -398,10 +460,21 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
     // Calculate queueing delay (load-dependent)
     uint32_t queueDelay = CalculateQueueDelay(load);
 
-    // Total delay = base + (misses × penalty) + queue
-    uint32_t totalDelayNs = g_config.baseCpuCyclesNs +
-                            (cacheMisses * penaltyPerMiss) +
-                            queueDelay;
+    // Add base jitter (clamped to zero)
+    uint32_t jitterNs = 0;
+    if (g_baseJitterRv)
+    {
+        double jitter = g_baseJitterRv->GetValue();
+        jitterNs = static_cast<uint32_t>(std::max<double>(0.0, std::lround(jitter)));
+    }
+
+    // Total delay = base + jitter + (misses × penalty) + queue
+    uint64_t totalDelayNs = static_cast<uint64_t>(g_config.baseCpuCyclesNs) +
+                            static_cast<uint64_t>(jitterNs) +
+                            static_cast<uint64_t>(cacheMisses) * penaltyPerMiss +
+                            static_cast<uint64_t>(queueDelay);
+
+    totalDelayNs = std::min<uint64_t>(totalDelayNs, 1000000000ULL); // 1 second cap
 
     NS_LOG_DEBUG("DelayIngress: node=" << nodeId
                  << " bytes=" << bytes
@@ -410,6 +483,7 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
                  << " misses=" << cacheMisses
                  << " penalty=" << penaltyPerMiss
                  << " queue=" << queueDelay
+                 << " jitter=" << jitterNs
                  << " totalDelay=" << totalDelayNs << "ns");
 
     // Print summary every 1000 packets for visibility
