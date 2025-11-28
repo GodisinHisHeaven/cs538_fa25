@@ -50,7 +50,8 @@ struct RunConfig
     // Hook parameters
     bool enableEgressHook = false;
     bool enableIngressHook = false;
-    std::string hookConfigPath = ""; // Use empty string for default, look in delay_hooks.cc for details
+    std::string delayModel = "CacheMiss";
+    std::string hookConfig = ""; // Config depends on delayModel used, look in delay_hooks.cc for details
 
     // Simulation parameters
     uint32_t seed = 1;
@@ -150,7 +151,8 @@ WriteConfigLog()
     ofs << "  \"maxBytesPerFlow\": " << g_config.maxBytes << ",\n";
     ofs << "  \"enableEgressHook\": " << (g_config.enableEgressHook ? "true" : "false") << ",\n";
     ofs << "  \"enableIngressHook\": " << (g_config.enableIngressHook ? "true" : "false") << ",\n";
-    ofs << "  \"hookConfigPath\": \"" << g_config.hookConfigPath << "\",\n";
+    ofs << "  \"delayModel\": \"" << g_config.delayModel << "\",\n";
+    ofs << "  \"hookConfig\": \"" << g_config.hookConfig << "\",\n";
     ofs << "  \"enablePcap\": " << (g_config.enablePcap ? "true" : "false") << ",\n";
     ofs << "  \"seed\": " << g_config.seed << ",\n";
     ofs << "  \"runId\": \"" << g_config.runId << "\"\n";
@@ -533,7 +535,8 @@ main(int argc, char* argv[])
     // Hook parameters
     cmd.AddValue("enableEgressHook", "Enable egress hook", g_config.enableEgressHook);
     cmd.AddValue("enableIngressHook", "Enable ingress hook", g_config.enableIngressHook);
-    cmd.AddValue("hookConfigPath", "Path to hook config file", g_config.hookConfigPath);
+    cmd.AddValue("delayModel", "DelayModel to use", g_config.delayModel);
+    cmd.AddValue("hookConfig", "Config for DelayModel", g_config.hookConfig);
 
     // Simulation parameters
     cmd.AddValue("seed", "Random seed", g_config.seed);
@@ -564,7 +567,8 @@ main(int argc, char* argv[])
     NS_LOG_INFO("Output: " << g_config.fullOutDir);
 
     // Initialize delay hooks
-    DelayHooks::Initialize(g_config.hookConfigPath,
+    DelayHooks::Initialize(g_config.delayModel,
+                          g_config.hookConfig,
                           g_config.enableEgressHook,
                           g_config.enableIngressHook,
                           g_config.seed);

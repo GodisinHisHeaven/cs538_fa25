@@ -14,8 +14,48 @@
 
 #include "ns3/nstime.h"
 #include <cstdint>
+#include <map>
+#include <memory>
 
 namespace ns3 {
+
+// Additional Node Properties that could be used in DelayHook
+struct NodeProperties 
+{
+    uint32_t cpuCoreContention = 0; // Number of competing processes/threads
+
+    NodeProperties() = default;
+};
+
+class DelayModel
+{
+public:
+    virtual ~DelayModel() = default;
+    virtual std::string GetName() const = 0;
+    virtual void Initialize(const std::string& config, uint32_t seed) = 0;
+    virtual void Reset() = 0;
+    virtual Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) = 0;
+    virtual Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) = 0;
+    
+    virtual void SetNodeProperties(uint32_t nodeId, const NodeProperties& props) 
+    {
+        nodeProperties[nodeId] = props;
+    }
+
+    virtual NodeProperties GetNodeProperties(uint32_t nodeId) const 
+    {
+        auto it = nodeProperties.find(nodeId);
+        if (it != nodeProperties.end()) 
+        {
+            return it->second;
+        } 
+        return NodeProperties(); //Return default if not found
+    }
+
+protected:
+    std::map<uint32_t, NodeProperties> nodeProperties;
+};
+
 
 /**
  * @brief Host delay hooks for egress and ingress packet processing
@@ -28,12 +68,13 @@ class DelayHooks
 public:
     /**
      * @brief Initialize the delay hooks with configuration
-     * @param configPath Path to model configuration file (currently ignored)
+     * @param config Model config
      * @param enableEgress Enable egress hook
      * @param enableIngress Enable ingress hook
      * @param seed Random seed for deterministic behavior
      */
-    static void Initialize(const std::string& configPath,
+    static void Initialize(const std::string& modelName,
+                          const std::string& config,
                           bool enableEgress,
                           bool enableIngress,
                           uint32_t seed);
@@ -66,11 +107,32 @@ public:
      */
     static bool IsIngressEnabled();
 
+    /**
+     * @brief Get the current delay model (for testing/debugging)
+     */
+    static DelayModel* GetActiveModel();
+
+    /**
+     * @brief Set properties for a specific node
+     * @param nodeId Node identifier
+     * @param props Properties to associate with the node
+     *
+     * Example usage:
+     *   DelayHooks::SetNodeProperties(0, NodeProperties{.cpuCoreContention = 4});
+     */
+    static void SetNodeProperties(uint32_t nodeId, const NodeProperties& props);
+
+     /**
+     * @brief Get properties for a specific node
+     * @param nodeId Node identifier
+     * @return Properties for the node (default if not set)
+     */
+    static NodeProperties GetNodeProperties(uint32_t nodeId);
+
 private:
+    static std::unique_ptr<DelayModel> s_model;
     static bool s_egressEnabled;
     static bool s_ingressEnabled;
-    static std::string s_configPath;
-    static uint32_t s_seed;
 };
 
 } // namespace ns3

@@ -28,10 +28,36 @@ namespace ns3 {
 NS_LOG_COMPONENT_DEFINE("DelayHooks");
 
 // ============================================================================
-// Configuration Structure
+// Default Delay Model (No delay injection)
 // ============================================================================
 
-struct DelayModelConfig
+class DefaultDelayModel: public DelayModel
+{
+public:
+    std::string GetName() const override
+    {
+        return "Default";
+    }
+
+    void Initialize(const std::string& config, uint32_t seed) override {}
+    void Reset() override {}
+    
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        return Time(0);
+    }
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        return Time(0);
+    }
+
+};
+
+// ============================================================================
+// CacheMiss Delay Model
+// ============================================================================
+
+struct CacheMissConfig
 {
     // Base parameters
     uint32_t baseCpuCyclesNs;
@@ -68,362 +94,384 @@ struct DelayModelConfig
     } loadTracking;
 };
 
-// Default configuration profiles
-static DelayModelConfig CreateRealisticConfig()
+class CacheMissDelayModel: public DelayModel
 {
-    DelayModelConfig config;
-    config.baseCpuCyclesNs = 150;
-    config.severityMultiplier = 1.0;
+    std::string GetName() const override
+    {
+        return "CacheMiss";
+    }
 
-    config.cache.cacheLineSize = 64;
-    config.cache.smallPacketThreshold = 256;
-    config.cache.largePacketThreshold = 1024;
-    config.cache.missProbabilitySmall = 0.1;
-    config.cache.missProbabilityMedium = 0.4;
-    config.cache.missProbabilityLarge = 0.7;
+    void Initialize(const std::string& config, uint32_t seed) override 
+    {
+        m_seed = seed;
 
-    config.penalty.basePenaltyNs = 100;
-    config.penalty.loadThreshold = 0.7;
-    config.penalty.highLoadMultiplier = 3.0;
+        // Load configuration based on config path
+        // For now, use simple profile selection based on config string
+        if (config.empty() || config == "realistic")
+        {
+            m_config = CreateRealisticConfig();
+            NS_LOG_INFO("  Using REALISTIC config (severity=1.0, ~2us impact)");
+        }
+        else if (config == "moderate")
+        {
+            m_config = CreateModerateConfig();
+            NS_LOG_INFO("  Using MODERATE config (severity=3.0, ~6us impact)");
+        }
+        else if (config == "severe")
+        {
+            m_config = CreateSevereConfig();
+            NS_LOG_INFO("  Using SEVERE config (severity=10.0, ~20us impact)");
+        }
+        else
+        {
+            // Default to realistic
+            m_config = CreateRealisticConfig();
+            NS_LOG_INFO("  Unknown config '" << config << "', using REALISTIC");
+        }
 
-    config.queue.baseQueueNs = 50;
-    config.queue.loadThreshold = 0.6;
-    config.queue.queueGrowthFactor = 2.0;
+        //Log for debugging
+        NS_LOG_INFO("DelayHooks initialized:");
+        NS_LOG_INFO("  Config: " << (config.empty() ? "realistic (default)" : config));
+        NS_LOG_INFO("  Seed: " << seed);
+        NS_LOG_INFO("  Model: base=" << m_config.baseCpuCyclesNs << "ns"
+                    << " severity=" << m_config.severityMultiplier
+                    << " penalty_threshold=" << m_config.penalty.loadThreshold
+                    << " queue_threshold=" << m_config.queue.loadThreshold);
+    }
 
-    config.loadTracking.windowSizeMs = 100;
-    config.loadTracking.nominalRatePps = 10000.0;
+    void Reset() override
+    {
+        m_nodeTimestamps.clear();
+        m_packetCount = 0;
+    }
 
-    return config;
-}
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        int64_t nowNs = Simulator::Now().GetNanoSeconds();
 
-static DelayModelConfig CreateModerateConfig()
-{
-    DelayModelConfig config = CreateRealisticConfig();
-    config.severityMultiplier = 3.0;  // 3x impact
-    return config;
-}
+        // Calculate load factor
+        double load = CalculateLoad(nodeId, nowNs);
 
-static DelayModelConfig CreateSevereConfig()
-{
-    DelayModelConfig config = CreateRealisticConfig();
-    config.severityMultiplier = 10.0;  // 10x impact
-    return config;
-}
+        // Calculate cache misses
+        uint32_t cacheMisses = CalculateCacheMisses(bytes);
+
+        // Calculate penalty (load-dependent)
+        uint32_t penaltyPerMiss = CalculatePenalty(load);
+
+        // Calculate queueing delay (load-dependent)
+        uint32_t queueDelay = CalculateQueueDelay(load);
+
+        // Total delay = base + (misses × penalty) + queue
+        uint32_t totalDelayNs = m_config.baseCpuCyclesNs +
+                                (cacheMisses * penaltyPerMiss) +
+                                queueDelay;
+
+        NS_LOG_DEBUG("DelayEgress: node=" << nodeId
+                    << " bytes=" << bytes
+                    << " seq=" << seq
+                    << " load=" << load
+                    << " misses=" << cacheMisses
+                    << " penalty=" << penaltyPerMiss
+                    << " queue=" << queueDelay
+                    << " totalDelay=" << totalDelayNs << "ns");
+
+        // Print summary every 1000 packets for visibility
+        // m_packetCount++;
+        // if (m_packetCount % 1000 == 0)
+        // {
+        //     std::cout << "Egress delay (pkt " << m_packetCount << "): "
+        //             << "load=" << load
+        //             << " misses=" << cacheMisses
+        //             << " delay=" << totalDelayNs << "ns" << std::endl;
+        // }
+        return NanoSeconds(totalDelayNs);
+    }
+
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        int64_t nowNs = Simulator::Now().GetNanoSeconds();
+
+        // Calculate load factor
+        double load = CalculateLoad(nodeId, nowNs);
+
+        // Calculate cache misses
+        uint32_t cacheMisses = CalculateCacheMisses(bytes);
+
+        // Calculate penalty (load-dependent)
+        uint32_t penaltyPerMiss = CalculatePenalty(load);
+
+        // Calculate queueing delay (load-dependent)
+        uint32_t queueDelay = CalculateQueueDelay(load);
+
+        // Total delay = base + (misses × penalty) + queue
+        uint32_t totalDelayNs = m_config.baseCpuCyclesNs +
+                                (cacheMisses * penaltyPerMiss) +
+                                queueDelay;
+
+        NS_LOG_DEBUG("DelayIngress: node=" << nodeId
+                    << " bytes=" << bytes
+                    << " seq=" << seq
+                    << " load=" << load
+                    << " misses=" << cacheMisses
+                    << " penalty=" << penaltyPerMiss
+                    << " queue=" << queueDelay
+                    << " totalDelay=" << totalDelayNs << "ns");
+
+        // Print summary every 1000 packets for visibility
+        // static uint32_t m_packetCount = 0;
+        // m_packetCount++;
+        // if (m_packetCount % 1000 == 0)
+        // {
+        //     std::cout << "Ingress delay (pkt " << m_packetCount << "): "
+        //             << "load=" << load
+        //             << " misses=" << cacheMisses
+        //             << " delay=" << totalDelayNs << "ns" << std::endl;
+        // }
+
+        return NanoSeconds(totalDelayNs);
+    }
+    
+private:
+    CacheMissConfig m_config;
+    uint32_t m_seed = 0;
+    uint32_t m_packetCount = 0;
+    std::map<uint32_t, std::deque<int64_t>> m_nodeTimestamps; // Per-node timestamp tracking for load calculation
+
+
+    // Default configuration profiles
+    static CacheMissConfig CreateRealisticConfig()
+    {
+        CacheMissConfig config;
+        config.baseCpuCyclesNs = 150;
+        config.severityMultiplier = 1.0;
+
+        config.cache.cacheLineSize = 64;
+        config.cache.smallPacketThreshold = 256;
+        config.cache.largePacketThreshold = 1024;
+        config.cache.missProbabilitySmall = 0.1;
+        config.cache.missProbabilityMedium = 0.4;
+        config.cache.missProbabilityLarge = 0.7;
+
+        config.penalty.basePenaltyNs = 100;
+        config.penalty.loadThreshold = 0.7;
+        config.penalty.highLoadMultiplier = 3.0;
+
+        config.queue.baseQueueNs = 50;
+        config.queue.loadThreshold = 0.6;
+        config.queue.queueGrowthFactor = 2.0;
+
+        config.loadTracking.windowSizeMs = 100;
+        config.loadTracking.nominalRatePps = 10000.0;
+
+        return config;
+    }
+
+    static CacheMissConfig CreateModerateConfig()
+    {
+        CacheMissConfig config = CreateRealisticConfig();
+        config.severityMultiplier = 3.0;
+        return config;
+    }
+
+    static CacheMissConfig CreateSevereConfig()
+    {
+        CacheMissConfig config = CreateRealisticConfig();
+        config.severityMultiplier = 10.0;
+        return config;
+    }
+
+    /**
+     * Calculate cache misses probabilistically based on packet size
+     *
+     * Small packets (<= 256B): Low miss probability (0.1)
+     * Medium packets (256B-1KB): Medium miss probability (0.4)
+     * Large packets (> 1KB): High miss probability (0.7)
+     *
+     * Returns estimated number of cache line misses
+     */
+    uint32_t CalculateCacheMisses(uint32_t bytes)
+    {
+        double missProb;
+        if (bytes <= m_config.cache.smallPacketThreshold)
+        {
+            missProb = m_config.cache.missProbabilitySmall;
+        }
+        else if (bytes <= m_config.cache.largePacketThreshold)
+        {
+            missProb = m_config.cache.missProbabilityMedium;
+        }
+        else
+        {
+            missProb = m_config.cache.missProbabilityLarge;
+        }
+
+        // Calculate number of cache lines this packet spans
+        uint32_t cacheLines = (bytes + m_config.cache.cacheLineSize - 1) /
+                            m_config.cache.cacheLineSize;
+
+        // Apply probability to get expected cache misses
+        uint32_t cacheMisses = static_cast<uint32_t>(std::ceil(cacheLines * missProb));
+
+        NS_LOG_DEBUG("CalculateCacheMisses: bytes=" << bytes
+                    << " cacheLines=" << cacheLines
+                    << " missProb=" << missProb
+                    << " misses=" << cacheMisses);
+
+        return cacheMisses;
+    }
+
+    /**
+     * Calculate current load factor from rolling window of packet timestamps
+     *
+     * Load = (packets in window) / (window duration × nominal rate)
+     *
+     * Returns load factor (0.0 = no load, 1.0 = nominal load, >1.0 = overload)
+     */
+    double CalculateLoad(uint32_t nodeId, int64_t currentTimeNs)
+    {
+        auto& timestamps = m_nodeTimestamps[nodeId];
+
+        // Remove expired timestamps (older than window)
+        int64_t windowNs = static_cast<int64_t>(m_config.loadTracking.windowSizeMs) * 1000000LL;
+        int64_t cutoffTime = currentTimeNs - windowNs;
+
+        while (!timestamps.empty() && timestamps.front() < cutoffTime)
+        {
+            timestamps.pop_front();
+        }
+
+        // Add current packet timestamp
+        timestamps.push_back(currentTimeNs);
+
+        // Calculate load
+        double packetsInWindow = static_cast<double>(timestamps.size());
+        double windowDurationS = static_cast<double>(windowNs) / 1e9;
+        double actualRate = packetsInWindow / windowDurationS;
+        double load = actualRate / m_config.loadTracking.nominalRatePps;
+
+        NS_LOG_DEBUG("CalculateLoad: node=" << nodeId
+                    << " packetsInWindow=" << packetsInWindow
+                    << " actualRate=" << actualRate
+                    << " load=" << load);
+
+        return load;
+    }
+
+    /**
+     * Calculate cache miss penalty based on load (step function)
+     *
+     * Below threshold: Base penalty
+     * Above threshold: Base penalty × multiplier
+     *
+     * Returns penalty per cache miss in nanoseconds
+     */
+    uint32_t CalculatePenalty(double load)
+    {
+        uint32_t penalty = m_config.penalty.basePenaltyNs;
+
+        if (load >= m_config.penalty.loadThreshold)
+        {
+            penalty = static_cast<uint32_t>(penalty * m_config.penalty.highLoadMultiplier);
+            NS_LOG_DEBUG("CalculatePenalty: HIGH LOAD - load=" << load
+                        << " threshold=" << m_config.penalty.loadThreshold
+                        << " penalty=" << penalty);
+        }
+        else
+        {
+            NS_LOG_DEBUG("CalculatePenalty: normal load - load=" << load
+                        << " penalty=" << penalty);
+        }
+
+        return static_cast<uint32_t>(penalty * m_config.severityMultiplier);
+    }
+
+    /**
+     * Calculate queueing delay based on load (step function with growth)
+     *
+     * Below threshold: Base queue delay
+     * Above threshold: Base delay + growth based on excess load
+     *
+     * Returns queueing delay in nanoseconds
+     */
+    uint32_t CalculateQueueDelay(double load)
+    {
+        uint32_t queueDelay = m_config.queue.baseQueueNs;
+
+        if (load >= m_config.queue.loadThreshold)
+        {
+            double excessLoad = load - m_config.queue.loadThreshold;
+            uint32_t additionalDelay = static_cast<uint32_t>(
+                m_config.queue.baseQueueNs * m_config.queue.queueGrowthFactor * excessLoad
+            );
+            queueDelay += additionalDelay;
+
+            NS_LOG_DEBUG("CalculateQueueDelay: HIGH LOAD - load=" << load
+                        << " excessLoad=" << excessLoad
+                        << " queueDelay=" << queueDelay);
+        }
+        else
+        {
+            NS_LOG_DEBUG("CalculateQueueDelay: normal load - load=" << load
+                        << " queueDelay=" << queueDelay);
+        }
+
+        return static_cast<uint32_t>(queueDelay * m_config.severityMultiplier);
+    }
+};
 
 // ============================================================================
-// Static State
+// DelayHooks Impl
 // ============================================================================
-
-// Per-node timestamp tracking for load calculation
-static std::map<uint32_t, std::deque<int64_t>> g_nodeTimestamps;
-
-// Global configuration
-static DelayModelConfig g_config;
-static bool g_configInitialized = false;
 
 // Static member initialization
 bool DelayHooks::s_egressEnabled = false;
 bool DelayHooks::s_ingressEnabled = false;
-std::string DelayHooks::s_configPath = "";
-uint32_t DelayHooks::s_seed = 0;
+std::unique_ptr<DelayModel> DelayHooks::s_model = nullptr;
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/**
- * Calculate cache misses probabilistically based on packet size
- *
- * Small packets (<= 256B): Low miss probability (0.1)
- * Medium packets (256B-1KB): Medium miss probability (0.4)
- * Large packets (> 1KB): High miss probability (0.7)
- *
- * Returns estimated number of cache line misses
- */
-static uint32_t CalculateCacheMisses(uint32_t bytes)
-{
-    if (!g_configInitialized)
-    {
-        return 0;
-    }
-
-    double missProb;
-    if (bytes <= g_config.cache.smallPacketThreshold)
-    {
-        missProb = g_config.cache.missProbabilitySmall;
-    }
-    else if (bytes <= g_config.cache.largePacketThreshold)
-    {
-        missProb = g_config.cache.missProbabilityMedium;
-    }
-    else
-    {
-        missProb = g_config.cache.missProbabilityLarge;
-    }
-
-    // Calculate number of cache lines this packet spans
-    uint32_t cacheLines = (bytes + g_config.cache.cacheLineSize - 1) /
-                          g_config.cache.cacheLineSize;
-
-    // Apply probability to get expected cache misses
-    uint32_t cacheMisses = static_cast<uint32_t>(std::ceil(cacheLines * missProb));
-
-    NS_LOG_DEBUG("CalculateCacheMisses: bytes=" << bytes
-                 << " cacheLines=" << cacheLines
-                 << " missProb=" << missProb
-                 << " misses=" << cacheMisses);
-
-    return cacheMisses;
-}
-
-/**
- * Calculate current load factor from rolling window of packet timestamps
- *
- * Load = (packets in window) / (window duration × nominal rate)
- *
- * Returns load factor (0.0 = no load, 1.0 = nominal load, >1.0 = overload)
- */
-static double CalculateLoad(uint32_t nodeId, int64_t currentTimeNs)
-{
-    if (!g_configInitialized)
-    {
-        return 0.0;
-    }
-
-    auto& timestamps = g_nodeTimestamps[nodeId];
-
-    // Remove expired timestamps (older than window)
-    int64_t windowNs = static_cast<int64_t>(g_config.loadTracking.windowSizeMs) * 1000000LL;
-    int64_t cutoffTime = currentTimeNs - windowNs;
-
-    while (!timestamps.empty() && timestamps.front() < cutoffTime)
-    {
-        timestamps.pop_front();
-    }
-
-    // Add current packet timestamp
-    timestamps.push_back(currentTimeNs);
-
-    // Calculate load
-    double packetsInWindow = static_cast<double>(timestamps.size());
-    double windowDurationS = static_cast<double>(windowNs) / 1e9;
-    double actualRate = packetsInWindow / windowDurationS;
-    double load = actualRate / g_config.loadTracking.nominalRatePps;
-
-    NS_LOG_DEBUG("CalculateLoad: node=" << nodeId
-                 << " packetsInWindow=" << packetsInWindow
-                 << " actualRate=" << actualRate
-                 << " load=" << load);
-
-    return load;
-}
-
-/**
- * Calculate cache miss penalty based on load (step function)
- *
- * Below threshold: Base penalty
- * Above threshold: Base penalty × multiplier
- *
- * Returns penalty per cache miss in nanoseconds
- */
-static uint32_t CalculatePenalty(double load)
-{
-    if (!g_configInitialized)
-    {
-        return 0;
-    }
-
-    uint32_t penalty = g_config.penalty.basePenaltyNs;
-
-    if (load >= g_config.penalty.loadThreshold)
-    {
-        penalty = static_cast<uint32_t>(penalty * g_config.penalty.highLoadMultiplier);
-        NS_LOG_DEBUG("CalculatePenalty: HIGH LOAD - load=" << load
-                     << " threshold=" << g_config.penalty.loadThreshold
-                     << " penalty=" << penalty);
-    }
-    else
-    {
-        NS_LOG_DEBUG("CalculatePenalty: normal load - load=" << load
-                     << " penalty=" << penalty);
-    }
-
-    return static_cast<uint32_t>(penalty * g_config.severityMultiplier);
-}
-
-/**
- * Calculate queueing delay based on load (step function with growth)
- *
- * Below threshold: Base queue delay
- * Above threshold: Base delay + growth based on excess load
- *
- * Returns queueing delay in nanoseconds
- */
-static uint32_t CalculateQueueDelay(double load)
-{
-    if (!g_configInitialized)
-    {
-        return 0;
-    }
-
-    uint32_t queueDelay = g_config.queue.baseQueueNs;
-
-    if (load >= g_config.queue.loadThreshold)
-    {
-        double excessLoad = load - g_config.queue.loadThreshold;
-        uint32_t additionalDelay = static_cast<uint32_t>(
-            g_config.queue.baseQueueNs * g_config.queue.queueGrowthFactor * excessLoad
-        );
-        queueDelay += additionalDelay;
-
-        NS_LOG_DEBUG("CalculateQueueDelay: HIGH LOAD - load=" << load
-                     << " excessLoad=" << excessLoad
-                     << " queueDelay=" << queueDelay);
-    }
-    else
-    {
-        NS_LOG_DEBUG("CalculateQueueDelay: normal load - load=" << load
-                     << " queueDelay=" << queueDelay);
-    }
-
-    return static_cast<uint32_t>(queueDelay * g_config.severityMultiplier);
-}
-
-void DelayHooks::Initialize(const std::string& configPath,
+void DelayHooks::Initialize(const std::string& modelName,
+                       const std::string& config,
                        bool enableEgress,
                        bool enableIngress,
                        uint32_t seed)
 {
-    s_configPath = configPath;
     s_egressEnabled = enableEgress;
     s_ingressEnabled = enableIngress;
-    s_seed = seed;
 
-    // Load configuration based on config path
-    // For now, use simple profile selection based on configPath string
-    if (configPath.empty() || configPath == "realistic")
-    {
-        g_config = CreateRealisticConfig();
-        NS_LOG_INFO("  Using REALISTIC config (severity=1.0, ~2us impact)");
-    }
-    else if (configPath == "moderate")
-    {
-        g_config = CreateModerateConfig();
-        NS_LOG_INFO("  Using MODERATE config (severity=3.0, ~6us impact)");
-    }
-    else if (configPath == "severe")
-    {
-        g_config = CreateSevereConfig();
-        NS_LOG_INFO("  Using SEVERE config (severity=10.0, ~20us impact)");
-    }
-    else
-    {
-        // Default to realistic
-        g_config = CreateRealisticConfig();
-        NS_LOG_INFO("  Unknown config '" << configPath << "', using REALISTIC");
+    if (modelName == "Default") {
+        s_model = std::make_unique<DefaultDelayModel>();
+    } else if (modelName == "CacheMiss") {
+        s_model = std::make_unique<CacheMissDelayModel>();
+    } else {
+        s_model = std::make_unique<DefaultDelayModel>();
     }
 
-    g_configInitialized = true;
+    s_model->Initialize(config, seed);
 
-    // Clear any existing timestamp data
-    g_nodeTimestamps.clear();
+    std::cout << "DelayHooks initialized:" << "\n";
+    std::cout << "  Model: " << (s_model ? s_model->GetName() : "none") << "\n";
+    std::cout << "  Config: " << (config) << "\n";
+    std::cout << "  Egress enabled: " << (enableEgress ? "yes" : "no") << "\n";
+    std::cout << "  Ingress enabled: " << (enableIngress ? "yes" : "no") << "\n";
+    std::cout << "  Seed: " << seed << "\n";
 
-    NS_LOG_INFO("DelayHooks initialized:");
-    NS_LOG_INFO("  Egress enabled: " << (enableEgress ? "yes" : "no"));
-    NS_LOG_INFO("  Ingress enabled: " << (enableIngress ? "yes" : "no"));
-    NS_LOG_INFO("  Config: " << (configPath.empty() ? "realistic (default)" : configPath));
-    NS_LOG_INFO("  Seed: " << seed);
-    NS_LOG_INFO("  Model: base=" << g_config.baseCpuCyclesNs << "ns"
-                << " severity=" << g_config.severityMultiplier
-                << " penalty_threshold=" << g_config.penalty.loadThreshold
-                << " queue_threshold=" << g_config.queue.loadThreshold);
 }
 
 Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 {
-    if (!s_egressEnabled || !g_configInitialized)
+    if (!s_egressEnabled || !s_model)
     {
         return Time(0);
     }
-
-    int64_t nowNs = Simulator::Now().GetNanoSeconds();
-
-    // Calculate load factor
-    double load = CalculateLoad(nodeId, nowNs);
-
-    // Calculate cache misses
-    uint32_t cacheMisses = CalculateCacheMisses(bytes);
-
-    // Calculate penalty (load-dependent)
-    uint32_t penaltyPerMiss = CalculatePenalty(load);
-
-    // Calculate queueing delay (load-dependent)
-    uint32_t queueDelay = CalculateQueueDelay(load);
-
-    // Total delay = base + (misses × penalty) + queue
-    uint32_t totalDelayNs = g_config.baseCpuCyclesNs +
-                            (cacheMisses * penaltyPerMiss) +
-                            queueDelay;
-
-    NS_LOG_DEBUG("DelayEgress: node=" << nodeId
-                 << " bytes=" << bytes
-                 << " seq=" << seq
-                 << " load=" << load
-                 << " misses=" << cacheMisses
-                 << " penalty=" << penaltyPerMiss
-                 << " queue=" << queueDelay
-                 << " totalDelay=" << totalDelayNs << "ns");
-
-    return NanoSeconds(totalDelayNs);
+    return s_model->CalculateEgressDelay(nodeId, bytes, seq);
 }
 
 Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 {
-    if (!s_ingressEnabled || !g_configInitialized)
+    if (!s_ingressEnabled || !s_model)
     {
         return Time(0);
     }
-
-    int64_t nowNs = Simulator::Now().GetNanoSeconds();
-
-    // Calculate load factor
-    double load = CalculateLoad(nodeId, nowNs);
-
-    // Calculate cache misses
-    uint32_t cacheMisses = CalculateCacheMisses(bytes);
-
-    // Calculate penalty (load-dependent)
-    uint32_t penaltyPerMiss = CalculatePenalty(load);
-
-    // Calculate queueing delay (load-dependent)
-    uint32_t queueDelay = CalculateQueueDelay(load);
-
-    // Total delay = base + (misses × penalty) + queue
-    uint32_t totalDelayNs = g_config.baseCpuCyclesNs +
-                            (cacheMisses * penaltyPerMiss) +
-                            queueDelay;
-
-    NS_LOG_DEBUG("DelayIngress: node=" << nodeId
-                 << " bytes=" << bytes
-                 << " seq=" << seq
-                 << " load=" << load
-                 << " misses=" << cacheMisses
-                 << " penalty=" << penaltyPerMiss
-                 << " queue=" << queueDelay
-                 << " totalDelay=" << totalDelayNs << "ns");
-
-    // Print summary every 1000 packets for visibility
-    static uint32_t packetCount = 0;
-    packetCount++;
-    if (packetCount % 1000 == 0)
-    {
-        std::cout << "Ingress delay (pkt " << packetCount << "): "
-                  << "load=" << load
-                  << " misses=" << cacheMisses
-                  << " delay=" << totalDelayNs << "ns" << std::endl;
-    }
-
-    return NanoSeconds(totalDelayNs);
+    return s_model->CalculateIngressDelay(nodeId, bytes, seq);
 }
 
 bool DelayHooks::IsEgressEnabled()
@@ -434,6 +482,32 @@ bool DelayHooks::IsEgressEnabled()
 bool DelayHooks::IsIngressEnabled()
 {
     return s_ingressEnabled;
+}
+
+DelayModel* DelayHooks::GetActiveModel()
+{
+    return s_model.get();
+}
+
+void DelayHooks::SetNodeProperties(uint32_t nodeId, const NodeProperties& props)
+{
+    if (s_model)
+    {
+        return s_model->SetNodeProperties(nodeId, props);
+    }
+
+    std::cout << "DelayHook has no model!" << std::endl;
+}
+
+NodeProperties DelayHooks::GetNodeProperties(uint32_t nodeId)
+{
+    if (s_model)
+    {
+        return s_model->GetNodeProperties(nodeId);
+    }
+    
+    std::cout << "DelayHook has no model!" << std::endl;
+    return NodeProperties();
 }
 
 } // namespace ns3
