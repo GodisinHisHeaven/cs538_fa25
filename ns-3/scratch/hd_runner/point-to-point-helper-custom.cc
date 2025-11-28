@@ -93,14 +93,23 @@ DelayedPointToPointChannel::TransmitStart(Ptr<const Packet> p,
         uint32_t seq = m_egressSeq[srcNodeId]++;
         uint32_t bytes = p->GetSize();
         egressDelay = DelayHooks::DelayEgress(srcNodeId, bytes, seq);
+    }
 
+    Time ingressDelay = NanoSeconds(0);
+
+    if (DelayHooks::IsIngressEnabled()) 
+    {
+        uint32_t dstNodeId = dst->GetNode()->GetId();
+        uint32_t seq = m_egressSeq[dstNodeId]++;
+        uint32_t bytes = p->GetSize();
+        ingressDelay = DelayHooks::DelayEgress(dstNodeId, bytes, seq);
     }
 
     // Get propagation delay from channel
     Time propDelay = GetDelay();
 
-    // Total delay = egress delay + propagation delay + transmission time
-    Time totalDelay = egressDelay + propDelay + txTime;
+    // Total delay = egress delay (tx) + transmission time + propagation delay + ingressDelay (rx)
+    Time totalDelay = egressDelay + txTime + propDelay + ingressDelay;
 
     // Schedule packet reception at destination with correct node context
     // Using ScheduleWithContext ensures the simulator context is set to the destination node
