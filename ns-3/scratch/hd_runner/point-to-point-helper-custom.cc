@@ -37,6 +37,8 @@ public:
 private:
     // Track sequence numbers for egress hook
     std::map<uint32_t, uint32_t> m_egressSeq;
+    // Track sequence numbers for ingress hook
+    std::map<uint32_t, uint32_t> m_ingressSeq;
 };
 
 TypeId
@@ -95,14 +97,15 @@ DelayedPointToPointChannel::TransmitStart(Ptr<const Packet> p,
         egressDelay = DelayHooks::DelayEgress(srcNodeId, bytes, seq);
     }
 
+    // Calculate ingress delay if hook is enabled
     Time ingressDelay = NanoSeconds(0);
 
     if (DelayHooks::IsIngressEnabled()) 
     {
         uint32_t dstNodeId = dst->GetNode()->GetId();
-        uint32_t seq = m_egressSeq[dstNodeId]++;
+        uint32_t seq = m_ingressSeq[dstNodeId]++;
         uint32_t bytes = p->GetSize();
-        ingressDelay = DelayHooks::DelayEgress(dstNodeId, bytes, seq);
+        ingressDelay = DelayHooks::DelayIngress(dstNodeId, bytes, seq);
     }
 
     // Get propagation delay from channel
