@@ -419,6 +419,65 @@ private:
     }
 };
 
+
+class UHNDelayModel: public DelayModel
+{
+public:
+    std::string GetName() const override
+    {
+        return "UHN";
+    }
+
+    void Initialize(const std::string& config, uint32_t seed) override {}
+    void Reset() override {}
+    
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        NodeProperties props = GetNodeProperties(nodeId);
+
+        uint32_t p2mWriteConstantLatency = 300;
+
+
+        uint32_t switchingDelay = 1 * 0.50 * 10 //averageRpqOccupancy * numSwitches  / linesRead * timeToSwitchWriteToRead;
+        uint32_t writeHolBlocking = averageRpqOccupancy * linesWritten / linesRead * timeToTransmit;
+        uint32_t readHolBlocking = (averageRpqOccupancy - 1) * timeToTransmit;
+        uint32_t topOfQueueDelay = numActRead / linesRead * timeToAct + numPreConflictRead / linesRead * timeToPre;
+
+        uint32_t lRead = constantRead + switchingDelay + writeHolBlocking + readHolBlocking + topOfQueueDelay;
+
+        //ReadWrite caused by reading to cache during a write and writing back later
+        // P2M write uses this
+        // C2M-Write Domain: LFB -> CHA (credit allocated at LFB and replenished at CHA)
+        // - Degradation in tput caused by DRAM row miss ratio and load imbalance across banks
+        // P2M-Write Domain: IIO -> CHA -> MC (credit allocated at IIO and replenished at MC)
+        // - latency inflation in P2M-Write Domain latency (~20-30ns)
+        // - with 3-4 cores C2M start to reduce P2M tput as memory bandwidth gets saurated (MC write queue full) leading to backlog of writes at CHA
+        // - domain inflation only for P2M-write domain (3-4 C2M cores result in latency increase 1.5x) and all domain credits used (92)
+        // C2M ReadWrite bound by C2M Read domain latency (~12% increase) as C2M write domain latency does not increase
+        // As write backlog at CHAT continue to increas with >4C2M cores, CHA begins to apply backpressure (RPQ capped impacting both domains 50ns)
+        uint32_t switchingDelay = numWriteRequestsWaiting * numSwitches  / linesWritten * timeToSwitchReadToWrite;
+        uint32_t readHolBlocking = numWriteRequestsWaiting * linesRead / linesWritten * timeToTransmit;
+        uint32_t writeHolBlocking = (numWriteRequestsWaiting - 1) * timeToTransmit;
+        uint32_t topOfQueueDelay = numActWrite / linesWritten * timeToAct + numPreConflictWrite / linesWritten * timeToPre;
+
+        uint32_t lWrite = constantWrite + probabilityWpqFull * (switchingDelay + readHolBlocking + writeHolBlocking + topOfQueueDelay); 
+        
+        
+        // // Scale delay based on CPU contention
+        // uint32_t baseDelay = 1000000;  // ns
+        // uint32_t contentionMultiplier = 1 + props.cpuCoreContention;
+
+        // // std::cout <<  "contentionMulti: " << contentionMultiplier << "\n";
+        
+        // return NanoSeconds(baseDelay * contentionMultiplier);
+    }
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    {
+        return Time(0);
+    }
+
+};
+
 // ============================================================================
 // DelayHooks Impl
 // ============================================================================
@@ -441,6 +500,8 @@ void DelayHooks::Initialize(const std::string& modelName,
         s_model = std::make_unique<DefaultDelayModel>();
     } else if (modelName == "CacheMiss") {
         s_model = std::make_unique<CacheMissDelayModel>();
+    } else if (modelName == "UHN") {
+        s_model = std::make_unique<UHNDelayModel>();
     } else {
         s_model = std::make_unique<DefaultDelayModel>();
     }

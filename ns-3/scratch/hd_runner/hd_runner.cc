@@ -535,7 +535,7 @@ main(int argc, char* argv[])
     // Hook parameters
     cmd.AddValue("enableEgressHook", "Enable egress hook", g_config.enableEgressHook);
     cmd.AddValue("enableIngressHook", "Enable ingress hook", g_config.enableIngressHook);
-    cmd.AddValue("delayModel", "DelayModel to use", g_config.delayModel);
+    cmd.AddValue("delayModel", "DelayModel to use (Default, CacheMiss, UHN)", g_config.delayModel);
     cmd.AddValue("hookConfig", "Config for DelayModel", g_config.hookConfig);
 
     // Simulation parameters
@@ -671,6 +671,12 @@ main(int argc, char* argv[])
     {
         NS_LOG_INFO("  PCAP: enabled (client-side only)");
     }
+    
+    // Set Host0 (server) with high CPU contention
+    NodeProperties props;
+    props.cpuCoreContention = 6;
+
+    DelayHooks::SetNodeProperties(hosts.Get(0)->GetId(), props);
 
     // Run simulation
     Simulator::Stop(Seconds(g_config.duration + 10.0));
