@@ -41,12 +41,12 @@ public:
 
     void Initialize(const std::string& config, uint32_t seed) override {}
     void Reset() override {}
-    
-    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
     {
         return Time(0);
     }
-    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
     {
         return Time(0);
     }
@@ -101,7 +101,7 @@ class CacheMissDelayModel: public DelayModel
         return "CacheMiss";
     }
 
-    void Initialize(const std::string& config, uint32_t seed) override 
+    void Initialize(const std::string& config, uint32_t seed) override
     {
         m_seed = seed;
 
@@ -145,7 +145,7 @@ class CacheMissDelayModel: public DelayModel
         m_packetCount = 0;
     }
 
-    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
     {
         int64_t nowNs = Simulator::Now().GetNanoSeconds();
 
@@ -187,7 +187,7 @@ class CacheMissDelayModel: public DelayModel
         return NanoSeconds(totalDelayNs);
     }
 
-    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
     {
         int64_t nowNs = Simulator::Now().GetNanoSeconds();
 
@@ -230,7 +230,7 @@ class CacheMissDelayModel: public DelayModel
 
         return NanoSeconds(totalDelayNs);
     }
-    
+
 private:
     CacheMissConfig m_config;
     uint32_t m_seed = 0;
@@ -420,60 +420,113 @@ private:
 };
 
 
-class UHNDelayModel: public DelayModel
+class AnalyticalDelayModel: public DelayModel
 {
+
+private:
+    std::mt19937 m_rng;
+    bool m_enableRandomness = false;
+    double m_randomnessFactor = 0.2; // Fixed 20% variation
+
+    void ParseConfig(const std::string& config)
+    {
+        if (config == "true") {
+            m_enableRandomness = true;
+            m_randomnessFactor = 0.1; // Default 10% variation
+        } else {
+            m_enableRandomness = false;
+            m_randomnessFactor = 0.0;
+        }
+        std::cout << "AnalyticalDelayModel config: enableRandomness=" << m_enableRandomness
+                  << " randomnessFactor=" << m_randomnessFactor << std::endl;
+    }
+
+    int64_t ApplyRandomness(int64_t baseValue)
+    {
+        if (!m_enableRandomness || m_randomnessFactor <= 0.0) {
+            return baseValue;
+        }
+
+        // Normal distribution: mean=0, std_dev=randomnessFactor/3
+        // This gives ~99.7% of values within randomnessFactor
+        std::normal_distribution<double> dist(0.0, m_randomnessFactor / 3.0);
+        double variation = dist(m_rng);
+
+        // Apply variation to base value
+        int64_t randomValue = static_cast<int64_t>(baseValue * (1.0 + variation));
+
+        // Ensure non-negative result
+        return std::max(int64_t(0), randomValue);
+    }
+
 public:
     std::string GetName() const override
     {
-        return "UHN";
+        return "Analytical";
     }
 
-    void Initialize(const std::string& config, uint32_t seed) override {}
+    void Initialize(const std::string& config, uint32_t seed) override {
+        m_rng.seed(seed);
+        ParseConfig(config);
+    }
+
     void Reset() override {}
-    
-    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
+
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
+    {
+        return Time(0);
+    }
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
     {
         NodeProperties props = GetNodeProperties(nodeId);
 
-        uint32_t p2mWriteConstantLatency = 300;
+        // uint32_t p2mWriteConstantLatency = 300;
 
+        // uint32_t switchingDelay = static_cast<uint32_t>(14 * 0.50 * 8); //averageRpqOccupancy * numSwitches  / linesRead * timeToSwitchWriteToRead;
+        // uint32_t writeHolBlocking = static_cast<uint32_t>(14 * 0.50 * 2); // averageRpqOccupancy * linesWritten / linesRead * timeToTransmit;
+        // uint32_t readHolBlocking = static_cast<uint32_t>((14 - 1) * 2); // (averageRpqOccupancy - 1) * timeToTransmit;
+        // uint32_t topOfQueueDelay = static_cast<uint32_t>(0.25 * 14 + 0.25 * 14);// numActRead / linesRead * timeToAct + numPreConflictRead / linesRead * timeToPre;
 
-        uint32_t switchingDelay = 1 * 0.50 * 10 //averageRpqOccupancy * numSwitches  / linesRead * timeToSwitchWriteToRead;
-        uint32_t writeHolBlocking = averageRpqOccupancy * linesWritten / linesRead * timeToTransmit;
-        uint32_t readHolBlocking = (averageRpqOccupancy - 1) * timeToTransmit;
-        uint32_t topOfQueueDelay = numActRead / linesRead * timeToAct + numPreConflictRead / linesRead * timeToPre;
+        // uint32_t lRead = constantRead + switchingDelay + writeHolBlocking + readHolBlocking + topOfQueueDelay;
 
-        uint32_t lRead = constantRead + switchingDelay + writeHolBlocking + readHolBlocking + topOfQueueDelay;
+        // //ReadWrite caused by reading to cache during a write and writing back later on eviction
+        // // P2M write uses this
+        // // C2M-Write Domain: LFB -> CHA (credit allocated at LFB and replenished at CHA)
+        // // - Degradation in tput caused by DRAM row miss ratio and load imbalance across banks
+        // // P2M-Write Domain: IIO -> CHA -> MC (credit allocated at IIO and replenished at MC)
+        // // - latency inflation in P2M-Write Domain latency (~20-30ns)
+        // // - with 3-4 cores C2M start to reduce P2M tput as memory bandwidth gets saurated (MC write queue full) leading to backlog of writes at CHA
+        // // - domain inflation only for P2M-write domain (3-4 C2M cores result in latency increase 1.5x) and all domain credits used (92)
+        // // C2M ReadWrite bound by C2M Read domain latency (~12% increase) as C2M write domain latency does not increase
+        // // As write backlog at CHAT continue to increas with >4C2M cores, CHA begins to apply backpressure (RPQ capped impacting both domains 50ns)
 
-        //ReadWrite caused by reading to cache during a write and writing back later
-        // P2M write uses this
-        // C2M-Write Domain: LFB -> CHA (credit allocated at LFB and replenished at CHA)
-        // - Degradation in tput caused by DRAM row miss ratio and load imbalance across banks
-        // P2M-Write Domain: IIO -> CHA -> MC (credit allocated at IIO and replenished at MC)
-        // - latency inflation in P2M-Write Domain latency (~20-30ns)
-        // - with 3-4 cores C2M start to reduce P2M tput as memory bandwidth gets saurated (MC write queue full) leading to backlog of writes at CHA
-        // - domain inflation only for P2M-write domain (3-4 C2M cores result in latency increase 1.5x) and all domain credits used (92)
-        // C2M ReadWrite bound by C2M Read domain latency (~12% increase) as C2M write domain latency does not increase
-        // As write backlog at CHAT continue to increas with >4C2M cores, CHA begins to apply backpressure (RPQ capped impacting both domains 50ns)
-        uint32_t switchingDelay = numWriteRequestsWaiting * numSwitches  / linesWritten * timeToSwitchReadToWrite;
-        uint32_t readHolBlocking = numWriteRequestsWaiting * linesRead / linesWritten * timeToTransmit;
-        uint32_t writeHolBlocking = (numWriteRequestsWaiting - 1) * timeToTransmit;
-        uint32_t topOfQueueDelay = numActWrite / linesWritten * timeToAct + numPreConflictWrite / linesWritten * timeToPre;
+        // // throughput = avg IIO ocupancy / avg latency
+        // // For Nwaiting, we use counters from the CHA since this is where backlog would build up
+        // uint32_t switchingDelay = static_cast<uint32_t>(14 * 0.50 * 8); // numWriteRequestsWaiting * numSwitches  / linesWritten * timeToSwitchReadToWrite;
+        // uint32_t readHolBlocking = static_cast<uint32_t>(14 * 0.50 * 2); //numWriteRequestsWaiting * linesRead / linesWritten * timeToTransmit;
+        // uint32_t writeHolBlocking = static_cast<uint32_t>((14 - 1)  * 2);// (numWriteRequestsWaiting - 1) * timeToTransmit;
+        // uint32_t topOfQueueDelay = static_cast<uint32_t>(0.25 * 14 + 0.25 * 14);//numActWrite / linesWritten * timeToAct + numPreConflictWrite / linesWritten * timeToPre;
 
-        uint32_t lWrite = constantWrite + probabilityWpqFull * (switchingDelay + readHolBlocking + writeHolBlocking + topOfQueueDelay); 
-        
-        
-        // // Scale delay based on CPU contention
-        // uint32_t baseDelay = 1000000;  // ns
-        // uint32_t contentionMultiplier = 1 + props.cpuCoreContention;
+        // uint32_t lWrite = constantWrite + probabilityWpqFull * (switchingDelay + readHolBlocking + writeHolBlocking + topOfQueueDelay);
 
-        // // std::cout <<  "contentionMulti: " << contentionMultiplier << "\n";
-        
-        // return NanoSeconds(baseDelay * contentionMultiplier);
-    }
-    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq)
-    {
-        return Time(0);
+        std::map<int, int> p2mLatency = {
+            {0, 0},
+            {1, 40},
+            {2, 60},
+            {3, 130},
+            {4, 165}
+        };
+
+        if (props.cpuCoreContention > 4 || props.cpuCoreContention < 0) {
+            std::cout << "Invalid cpuCoreContention value: " << props.cpuCoreContention << "\n";
+            std::cout << "Valid range is 0-4. Returning 0 delay.\n";
+            return NanoSeconds(0);
+        }
+
+        int64_t baseLatency = p2mLatency[props.cpuCoreContention];
+        int64_t finalLatency = ApplyRandomness(baseLatency);
+
+        return NanoSeconds(finalLatency);
     }
 
 };
@@ -500,8 +553,8 @@ void DelayHooks::Initialize(const std::string& modelName,
         s_model = std::make_unique<DefaultDelayModel>();
     } else if (modelName == "CacheMiss") {
         s_model = std::make_unique<CacheMissDelayModel>();
-    } else if (modelName == "UHN") {
-        s_model = std::make_unique<UHNDelayModel>();
+    } else if (modelName == "Analytical") {
+        s_model = std::make_unique<AnalyticalDelayModel>();
     } else {
         s_model = std::make_unique<DefaultDelayModel>();
     }
@@ -566,7 +619,7 @@ NodeProperties DelayHooks::GetNodeProperties(uint32_t nodeId)
     {
         return s_model->GetNodeProperties(nodeId);
     }
-    
+
     std::cout << "DelayHook has no model!" << std::endl;
     return NodeProperties();
 }
