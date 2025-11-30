@@ -532,6 +532,411 @@ public:
 };
 
 // ============================================================================
+// Host Network Delay Model
+// Based on "Understanding the Host Network" (SIGCOMM 2024)
+// Models credit-based flow control across three domains:
+//   - C2M-Write: LFB -> CHA (12 credits, replenished at CHA)
+//   - C2M-Read:  LFB -> CHA -> MC (12 credits, replenished at MC)
+//   - P2M-Write: IIO -> CHA -> MC (92 credits, replenished at MC)
+// ============================================================================
+
+/**
+ * Represents an in-flight request with credit tracking
+ */
+struct InFlightRequest
+{
+    int64_t sendTimeNs;       // When the request was sent
+    int64_t completionTimeNs; // When credit will be replenished
+    uint32_t bytes;           // Request size
+    uint32_t creditsUsed;     // Number of credits consumed by this request
+};
+
+/**
+ * Credit-based queue model for a single domain
+ */
+class CreditQueue
+{
+public:
+    CreditQueue(const std::string& name, uint32_t maxCredits, int64_t baseLatencyNs)
+        : m_name(name),
+          m_maxCredits(maxCredits),
+          m_availableCredits(maxCredits),
+          m_baseLatencyNs(baseLatencyNs)
+    {
+    }
+
+    /**
+     * Try to send a request. Returns the queueing delay if credits need to wait.
+     * @param nowNs Current simulation time in nanoseconds
+     * @param latencyNs Latency until credit is replenished (domain-specific)
+     * @param creditsNeeded Number of credits needed (typically bytes/64 for cache lines)
+     * @return Queueing delay in nanoseconds (0 if credits immediately available)
+     *
+     * Note: If creditsNeeded > maxCredits, the request is split into multiple
+     * sub-requests, each using at most maxCredits. This models how large packets
+     * must be transferred in multiple batches through the credit-based pipeline.
+     */
+    int64_t SendRequest(int64_t nowNs, int64_t latencyNs, uint32_t creditsNeeded = 1)
+    {
+        // First, replenish any credits from completed requests
+        ReplenishCredits(nowNs);
+
+        int64_t totalQueueDelay = 0;
+        uint32_t remainingCredits = creditsNeeded;
+
+        // Process in batches if creditsNeeded exceeds maxCredits
+        while (remainingCredits > 0)
+        {
+            // Determine how many credits to use in this batch (at most maxCredits)
+            uint32_t batchCredits = std::min(remainingCredits, m_maxCredits);
+
+            // Wait until we have enough credits for this batch
+            while (m_availableCredits < batchCredits)
+            {
+                // Not enough credits - must wait for requests to complete
+                if (!m_inFlightRequests.empty())
+                {
+                    int64_t earliestCompletion = m_inFlightRequests.front().completionTimeNs;
+                    int64_t waitTime = std::max(int64_t(0), earliestCompletion - nowNs);
+                    totalQueueDelay += waitTime;
+                    
+                    // Update nowNs to when we actually can proceed (after waiting)
+                    nowNs += waitTime;
+                    
+                    // Replenish credits at the new time
+                    ReplenishCredits(nowNs);
+                }
+                else
+                {
+                    // No in-flight requests but not enough credits - shouldn't happen normally
+                    // Reset credits to max to avoid infinite loop
+                    m_availableCredits = m_maxCredits;
+                    break;
+                }
+            }
+
+            // Consume the credits for this batch
+            uint32_t creditsToUse = std::min(batchCredits, m_availableCredits);
+            m_availableCredits -= creditsToUse;
+
+            // Track this batch as an in-flight request
+            InFlightRequest req;
+            req.sendTimeNs = nowNs;
+            req.completionTimeNs = nowNs + latencyNs;
+            req.bytes = creditsToUse * 64; // Track bytes for reference
+            req.creditsUsed = creditsToUse;
+            m_inFlightRequests.push_back(req);
+
+            remainingCredits -= creditsToUse;
+        }
+
+        return totalQueueDelay;
+    }
+
+    /**
+     * Get current credit utilization (0.0 - 1.0+)
+     */
+    double GetUtilization() const
+    {
+        uint32_t inFlight = m_maxCredits - m_availableCredits;
+        return static_cast<double>(inFlight) / static_cast<double>(m_maxCredits);
+    }
+
+    /**
+     * Get number of requests waiting (queue depth)
+     */
+    uint32_t GetQueueDepth() const
+    {
+        return static_cast<uint32_t>(m_inFlightRequests.size());
+    }
+
+    /**
+     * Reset the queue state
+     */
+    void Reset()
+    {
+        m_availableCredits = m_maxCredits;
+        m_inFlightRequests.clear();
+    }
+
+    std::string GetName() const { return m_name; }
+    uint32_t GetMaxCredits() const { return m_maxCredits; }
+    uint32_t GetAvailableCredits() const { return m_availableCredits; }
+
+private:
+    void ReplenishCredits(int64_t nowNs)
+    {
+        while (!m_inFlightRequests.empty() &&
+               m_inFlightRequests.front().completionTimeNs <= nowNs)
+        {
+            uint32_t creditsToReturn = m_inFlightRequests.front().creditsUsed;
+            m_inFlightRequests.pop_front();
+            m_availableCredits = std::min(m_availableCredits + creditsToReturn, m_maxCredits);
+        }
+    }
+
+    std::string m_name;
+    uint32_t m_maxCredits;
+    uint32_t m_availableCredits;
+    int64_t m_baseLatencyNs;
+    std::deque<InFlightRequest> m_inFlightRequests;
+};
+
+/**
+ * Configuration for HostNetwork delay model
+ */
+struct HostNetworkConfig
+{
+    // C2M-Write Domain: LFB -> CHA
+    struct {
+        uint32_t maxCredits = 12;
+        int64_t baseLatencyNs = 10;  // ~10ns LFB to CHA
+    } c2mWrite;
+
+    // C2M-Read Domain: LFB -> CHA -> MC
+    struct {
+        uint32_t maxCredits = 12;
+        int64_t baseLatencyNs = 70;  // ~70ns LFB to MC (including CHA)
+    } c2mRead;
+
+    // P2M-Write Domain: IIO -> CHA -> MC
+    struct {
+        uint32_t maxCredits = 92;
+        int64_t baseLatencyNs = 300;  // ~300ns IIO to MC
+    } p2mWrite;
+
+    // Contention multipliers
+    struct {
+        double c2mContentionFactor = 1.2;   // 12% increase under C2M load
+        double p2mContentionFactor = 1.5;   // 50% increase with 3-4 C2M cores
+        double backpressureThreshold = 0.9; // CHA backpressure kicks in at 90% utilization
+        int64_t backpressurePenaltyNs = 50; // Additional 50ns when CHA applies backpressure
+    } contention;
+
+    // Randomness for realistic variance
+    bool enableRandomness = true;
+    double randomnessFactor = 0.2; // 20% variation
+};
+
+class HostNetworkDelayModel : public DelayModel
+{
+public:
+    HostNetworkDelayModel()
+        : m_c2mWriteQueue("C2M-Write", 12, 10),
+          m_c2mReadQueue("C2M-Read", 12, 70),
+          m_p2mWriteQueue("P2M-Write", 92, 300)
+    {
+    }
+
+    std::string GetName() const override
+    {
+        return "HostNetwork";
+    }
+
+    void Initialize(const std::string& config, uint32_t seed) override
+    {
+        m_rng.seed(seed);
+        ParseConfig(config);
+
+        std::cout << "HostNetworkDelayModel initialized:" << std::endl;
+        std::cout << "  C2M-Write: " << m_config.c2mWrite.maxCredits << " credits, "
+                  << m_config.c2mWrite.baseLatencyNs << "ns base latency" << std::endl;
+        std::cout << "  C2M-Read:  " << m_config.c2mRead.maxCredits << " credits, "
+                  << m_config.c2mRead.baseLatencyNs << "ns base latency" << std::endl;
+        std::cout << "  P2M-Write: " << m_config.p2mWrite.maxCredits << " credits, "
+                  << m_config.p2mWrite.baseLatencyNs << "ns base latency" << std::endl;
+        std::cout << "  Randomness: " << (m_config.enableRandomness ? "enabled" : "disabled")
+                  << " (" << (m_config.randomnessFactor * 100) << "%)" << std::endl;
+    }
+
+    void Reset() override
+    {
+        m_c2mWriteQueue.Reset();
+        m_c2mReadQueue.Reset();
+        m_p2mWriteQueue.Reset();
+    }
+
+    Time CalculateEgressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
+    {
+        return Time(0);
+    }
+
+    Time CalculateIngressDelay(uint32_t nodeId, uint32_t bytes, uint32_t seq) override
+    {
+        int64_t nowNs = Simulator::Now().GetNanoSeconds();
+        NodeProperties props = GetNodeProperties(nodeId);
+
+        int64_t totalDelayNs = 0;
+
+        // Calculate credits needed based on cache lines (bytes / 64)
+        uint32_t cacheLines = (bytes + 63) / 64; // Round up to nearest cache line
+
+        // Step 1: P2M-Write - NIC DMAs packet to memory
+        int64_t p2mWriteLatency = CalculateP2MWriteLatency(props);
+        int64_t p2mWriteQueueDelay = m_p2mWriteQueue.SendRequest(nowNs, p2mWriteLatency, cacheLines);
+        totalDelayNs += p2mWriteQueueDelay + p2mWriteLatency;
+
+        // Step 2: C2M-Read - CPU reads packet from memory
+        int64_t c2mReadLatency = CalculateC2MReadLatency(props);
+        int64_t c2mReadQueueDelay = m_c2mReadQueue.SendRequest(nowNs + totalDelayNs, c2mReadLatency, cacheLines);
+        totalDelayNs += c2mReadQueueDelay + c2mReadLatency;
+
+        // Apply contention effects
+        totalDelayNs = ApplyContentionEffects(totalDelayNs, props);
+
+        // Apply randomness
+        totalDelayNs = ApplyRandomness(totalDelayNs);
+
+        NS_LOG_DEBUG("HostNetwork Ingress: node=" << nodeId
+                    << " bytes=" << bytes
+                    << " p2mWriteDelay=" << p2mWriteQueueDelay
+                    << " c2mReadDelay=" << c2mReadQueueDelay
+                    << " totalDelay=" << totalDelayNs << "ns");
+
+        return NanoSeconds(totalDelayNs);
+    }
+
+private:
+    HostNetworkConfig m_config;
+    std::mt19937 m_rng;
+
+    // Credit queues for each domain
+    CreditQueue m_c2mWriteQueue;
+    CreditQueue m_c2mReadQueue;
+    CreditQueue m_p2mWriteQueue;
+
+    void ParseConfig(const std::string& config)
+    {
+        if (config.empty() || config == "default")
+        {
+            // Use default configuration
+        }
+        else if (config == "high_contention")
+        {
+            m_config.contention.c2mContentionFactor = 1.5;
+            m_config.contention.p2mContentionFactor = 2.0;
+            m_config.contention.backpressurePenaltyNs = 100;
+        }
+        else if (config == "no_random")
+        {
+            m_config.enableRandomness = false;
+        }
+
+        // Re-initialize queues with config values
+        m_c2mWriteQueue = CreditQueue("C2M-Write",
+                                       m_config.c2mWrite.maxCredits,
+                                       m_config.c2mWrite.baseLatencyNs);
+        m_c2mReadQueue = CreditQueue("C2M-Read",
+                                      m_config.c2mRead.maxCredits,
+                                      m_config.c2mRead.baseLatencyNs);
+        m_p2mWriteQueue = CreditQueue("P2M-Write",
+                                       m_config.p2mWrite.maxCredits,
+                                       m_config.p2mWrite.baseLatencyNs);
+    }
+
+    /**
+     * Calculate C2M-Write domain latency
+     * LFB -> CHA path
+     */
+    int64_t CalculateC2MWriteLatency(const NodeProperties& props)
+    {
+        int64_t latency = m_config.c2mWrite.baseLatencyNs;
+
+        // C2M-Write latency is relatively stable but increases slightly with contention
+        if (props.cpuCoreContention > 0)
+        {
+            // Minimal impact on C2M-Write domain
+            double factor = 1.0 + (props.cpuCoreContention * 0.05);
+            latency = static_cast<int64_t>(latency * factor);
+        }
+
+        return latency;
+    }
+
+    /**
+     * Calculate C2M-Read domain latency
+     * LFB -> CHA -> MC path
+     */
+    int64_t CalculateC2MReadLatency(const NodeProperties& props)
+    {
+        int64_t latency = m_config.c2mRead.baseLatencyNs;
+
+        if (props.cpuCoreContention > 0)
+        {
+            latency = static_cast<int64_t>(latency * m_config.contention.c2mContentionFactor);
+        }
+
+        return latency;
+    }
+
+    /**
+     * Calculate P2M-Write domain latency
+     * IIO -> CHA -> MC path
+     */
+    int64_t CalculateP2MWriteLatency(const NodeProperties& props)
+    {
+        int64_t latency = m_config.p2mWrite.baseLatencyNs;
+
+        // P2M-Write shows significant latency inflation with C2M contention
+        if (props.cpuCoreContention >= 3)
+        {
+            latency = static_cast<int64_t>(latency * m_config.contention.p2mContentionFactor);
+        }
+        else if (props.cpuCoreContention > 0)
+        {
+            // Gradual increase for lower contention
+            double factor = 1.0 + (props.cpuCoreContention * 0.1);
+            latency = static_cast<int64_t>(latency * factor);
+        }
+
+        return latency;
+    }
+
+    /**
+     * Apply contention effects based on queue utilization
+     * Models CHA backpressure when queues are heavily utilized
+     */
+    int64_t ApplyContentionEffects(int64_t baseDelayNs, const NodeProperties& props)
+    {
+        int64_t delay = baseDelayNs;
+
+        // Check for CHA backpressure (high utilization across queues)
+        double maxUtilization = std::max({
+            m_c2mWriteQueue.GetUtilization(),
+            m_c2mReadQueue.GetUtilization(),
+            m_p2mWriteQueue.GetUtilization()
+        });
+
+        if (maxUtilization >= m_config.contention.backpressureThreshold)
+        {
+            // CHA applies backpressure, adding additional delay
+            delay += m_config.contention.backpressurePenaltyNs;
+            NS_LOG_DEBUG("CHA backpressure applied: utilization=" << maxUtilization
+                        << " penalty=" << m_config.contention.backpressurePenaltyNs << "ns");
+        }
+
+        return delay;
+    }
+
+    /**
+     * Apply random variance for realistic behavior
+     */
+    int64_t ApplyRandomness(int64_t baseValue)
+    {
+        if (!m_config.enableRandomness || m_config.randomnessFactor <= 0.0)
+        {
+            return baseValue;
+        }
+
+        std::normal_distribution<double> dist(0.0, m_config.randomnessFactor / 3.0);
+        double variation = dist(m_rng);
+
+        int64_t randomValue = static_cast<int64_t>(baseValue * (1.0 + variation));
+        return std::max(int64_t(0), randomValue);
+    }
+};
+
+// ============================================================================
 // DelayHooks Impl
 // ============================================================================
 
@@ -555,6 +960,8 @@ void DelayHooks::Initialize(const std::string& modelName,
         s_model = std::make_unique<CacheMissDelayModel>();
     } else if (modelName == "Analytical") {
         s_model = std::make_unique<AnalyticalDelayModel>();
+    } else if (modelName == "HostNetwork") {
+        s_model = std::make_unique<HostNetworkDelayModel>();
     } else {
         s_model = std::make_unique<DefaultDelayModel>();
     }
