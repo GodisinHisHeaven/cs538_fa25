@@ -766,6 +766,10 @@ public:
         int64_t nowNs = Simulator::Now().GetNanoSeconds();
         NodeProperties props = GetNodeProperties(nodeId);
 
+        if (props.cpuCoreContention <= 0) {
+            return NanoSeconds(0);
+        }
+
         int64_t totalDelayNs = 0;
 
         // Calculate credits needed based on cache lines (bytes / 64)
