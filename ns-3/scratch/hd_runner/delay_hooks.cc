@@ -14,6 +14,7 @@
 
 #include "delay_hooks.h"
 #include "ns3/double.h"
+#include "ns3/exponential-random-variable.h"
 #include "ns3/log.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/simulator.h"
@@ -68,6 +69,15 @@ struct DelayModelConfig
         uint32_t tailSlopeNs; // multiplied by load (capped) for tail lift
     } ingress;
 
+    // Heavy-tail spikes to mimic rare OS scheduler hiccups / buffer stalls
+    struct {
+        double baseProbability;  // always-on chance for a spike
+        double loadSlope;        // additional probability per unit load
+        uint32_t baseMeanNs;     // mean spike size at idle
+        uint32_t heavyMeanNs;    // mean spike size at max load
+        uint32_t maxSpikeNs;     // cap to avoid unbounded spikes
+    } tail;
+
     // Load tracking
     struct {
         uint32_t windowSizeMs;
@@ -95,12 +105,18 @@ static DelayModelConfig CreateRealisticConfig()
     config.penalty.loadThreshold = 0.7;
     config.penalty.highLoadMultiplier = 3.0;
 
-    config.queue.baseQueueNs = 20;
-    config.queue.loadThreshold = 0.6;
-    config.queue.queueGrowthFactor = 1.0;
+    config.queue.baseQueueNs = 8000; // ~8us soft queueing/base variance
+    config.queue.loadThreshold = 0.55;
+    config.queue.queueGrowthFactor = 1.6;
 
-    config.ingress.baseIngressNs = 50000; // ~50us baseline host stack cost
-    config.ingress.tailSlopeNs = 0;       // disable tail for stability during tuning
+    config.ingress.baseIngressNs = 90000; // ~90us baseline host stack cost
+    config.ingress.tailSlopeNs = 30000;   // add ~30us at nominal load
+
+    config.tail.baseProbability = 0.001; // 0.1% background spikes
+    config.tail.loadSlope = 0.003;       // +0.3% per unit load
+    config.tail.baseMeanNs = 60000;      // 60us spikes in baseline
+    config.tail.heavyMeanNs = 20000000;  // ~20ms spikes when saturated
+    config.tail.maxSpikeNs = 50000000;   // cap at 50ms
 
     config.loadTracking.windowSizeMs = 10;
     config.loadTracking.nominalRatePps = 3000000.0; // ~100 Gbps at 4K MTU
@@ -145,6 +161,8 @@ static bool g_configInitialized = false;
 // Random variables
 static Ptr<UniformRandomVariable> g_cacheMissRv;
 static Ptr<NormalRandomVariable> g_baseJitterRv;
+static Ptr<UniformRandomVariable> g_tailTriggerRv;
+static Ptr<ExponentialRandomVariable> g_tailSpikeRv;
 
 // Static member initialization
 bool DelayHooks::s_egressEnabled = false;
@@ -270,9 +288,20 @@ static uint32_t CalculatePenalty(double load)
         return 0;
     }
 
-    // Smooth growth to avoid discontinuities
+    // Apply a step at the configured threshold, then smoothly ramp to the
+    // high-load multiplier as load approaches the configured max.
     double cappedLoad = std::min(load, g_config.loadTracking.maxLoad);
-    double multiplier = 1.0 + 0.5 * cappedLoad;
+    double multiplier = 1.0;
+
+    if (cappedLoad >= g_config.penalty.loadThreshold)
+    {
+        double loadRange = g_config.loadTracking.maxLoad - g_config.penalty.loadThreshold;
+        double normalizedExcess = loadRange > 0
+                                      ? std::min((cappedLoad - g_config.penalty.loadThreshold) / loadRange, 1.0)
+                                      : 1.0;
+        multiplier = 1.0 + (g_config.penalty.highLoadMultiplier - 1.0) * normalizedExcess;
+    }
+
     double penalty = static_cast<double>(g_config.penalty.basePenaltyNs) * multiplier;
 
     NS_LOG_DEBUG("CalculatePenalty: load=" << load
@@ -318,6 +347,49 @@ static uint32_t CalculateQueueDelay(double load)
     return static_cast<uint32_t>(queueDelay * g_config.severityMultiplier);
 }
 
+/**
+ * Occasionally inject a heavy-tail spike to mimic scheduler hiccups.
+ * The probability rises with load and the mean spike size ramps toward
+ * the heavy value as load approaches the configured maximum.
+ */
+static uint32_t CalculateTailSpike(double load)
+{
+    if (!g_configInitialized)
+    {
+        return 0;
+    }
+
+    double probability = g_config.tail.baseProbability + (g_config.tail.loadSlope * load);
+    probability = std::max(0.0, std::min(1.0, probability));
+
+    if (!g_tailTriggerRv || g_tailTriggerRv->GetValue() >= probability)
+    {
+        return 0;
+    }
+
+    double loadWeight = g_config.loadTracking.maxLoad > 0
+                            ? std::min(load / g_config.loadTracking.maxLoad, 1.0)
+                            : 0.0;
+    double meanNs = static_cast<double>(g_config.tail.baseMeanNs) +
+                    loadWeight * static_cast<double>(g_config.tail.heavyMeanNs - g_config.tail.baseMeanNs);
+
+    uint64_t spikeNs = 0;
+    if (g_tailSpikeRv)
+    {
+        g_tailSpikeRv->SetAttribute("Mean", DoubleValue(meanNs));
+        spikeNs = static_cast<uint64_t>(std::max<double>(0.0, g_tailSpikeRv->GetValue()));
+    }
+
+    spikeNs = std::min<uint64_t>(spikeNs, g_config.tail.maxSpikeNs);
+
+    NS_LOG_DEBUG("CalculateTailSpike: load=" << load
+                                             << " prob=" << probability
+                                             << " meanNs=" << meanNs
+                                             << " spikeNs=" << spikeNs);
+
+    return static_cast<uint32_t>(spikeNs);
+}
+
 void DelayHooks::Initialize(const std::string& configPath,
                        bool enableEgress,
                        bool enableIngress,
@@ -361,13 +433,17 @@ void DelayHooks::Initialize(const std::string& configPath,
     g_cacheMissRv = CreateObject<UniformRandomVariable>();
     g_baseJitterRv = CreateObject<NormalRandomVariable>();
     g_baseJitterRv->SetAttribute("Mean", DoubleValue(0.0));
-    g_baseJitterRv->SetAttribute("Variance", DoubleValue(50.0 * 50.0));
+    g_baseJitterRv->SetAttribute("Variance", DoubleValue(15000.0 * 15000.0));
+    g_tailTriggerRv = CreateObject<UniformRandomVariable>();
+    g_tailSpikeRv = CreateObject<ExponentialRandomVariable>();
 
     // Seed streams for repeatability across runs
     if (seed != 0)
     {
         g_cacheMissRv->SetStream(seed + 1);
         g_baseJitterRv->SetStream(seed + 2);
+        g_tailTriggerRv->SetStream(seed + 3);
+        g_tailSpikeRv->SetStream(seed + 4);
     }
 
     NS_LOG_INFO("DelayHooks initialized:");
@@ -401,11 +477,7 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 
     // Calculate queueing delay (load-dependent)
     uint32_t queueDelay = CalculateQueueDelay(load);
-
-    // Ingress shaping to mimic host stack latency (only on ingress path)
-    double cappedLoad = std::min(load, g_config.loadTracking.maxLoad);
-    uint32_t ingressShapingNs = g_config.ingress.baseIngressNs +
-                                static_cast<uint32_t>(g_config.ingress.tailSlopeNs * cappedLoad);
+    uint32_t tailSpike = CalculateTailSpike(load);
 
     // Add base jitter (clamped to zero)
     uint32_t jitterNs = 0;
@@ -415,12 +487,12 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
         jitterNs = static_cast<uint32_t>(std::max<double>(0.0, std::lround(jitter)));
     }
 
-    // Total delay = base + ingress shaping + jitter + (misses × penalty) + queue
+    // Total delay = base + jitter + (misses × penalty) + queue
     uint64_t totalDelayNs = static_cast<uint64_t>(g_config.baseCpuCyclesNs) +
-                            static_cast<uint64_t>(ingressShapingNs) +
                             static_cast<uint64_t>(jitterNs) +
                             static_cast<uint64_t>(cacheMisses) * penaltyPerMiss +
-                            static_cast<uint64_t>(queueDelay);
+                            static_cast<uint64_t>(queueDelay) +
+                            static_cast<uint64_t>(tailSpike);
 
     // Cap to avoid pathological values
     totalDelayNs = std::min<uint64_t>(totalDelayNs, 1000000000ULL); // 1 second cap
@@ -432,8 +504,8 @@ Time DelayHooks::DelayEgress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
                  << " misses=" << cacheMisses
                  << " penalty=" << penaltyPerMiss
                  << " queue=" << queueDelay
-                 << " ingressShape=" << ingressShapingNs
                  << " jitter=" << jitterNs
+                 << " tail=" << tailSpike
                  << " totalDelay=" << totalDelayNs << "ns");
 
     return NanoSeconds(totalDelayNs);
@@ -459,6 +531,12 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
 
     // Calculate queueing delay (load-dependent)
     uint32_t queueDelay = CalculateQueueDelay(load);
+    uint32_t tailSpike = CalculateTailSpike(load);
+
+    // Ingress shaping to mimic host stack latency (ingress path only)
+    double cappedLoad = std::min(load, g_config.loadTracking.maxLoad);
+    uint32_t ingressShapingNs = g_config.ingress.baseIngressNs +
+                                static_cast<uint32_t>(g_config.ingress.tailSlopeNs * cappedLoad);
 
     // Add base jitter (clamped to zero)
     uint32_t jitterNs = 0;
@@ -468,11 +546,13 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
         jitterNs = static_cast<uint32_t>(std::max<double>(0.0, std::lround(jitter)));
     }
 
-    // Total delay = base + jitter + (misses × penalty) + queue
+    // Total delay = base + ingress shaping + jitter + (misses × penalty) + queue
     uint64_t totalDelayNs = static_cast<uint64_t>(g_config.baseCpuCyclesNs) +
+                            static_cast<uint64_t>(ingressShapingNs) +
                             static_cast<uint64_t>(jitterNs) +
                             static_cast<uint64_t>(cacheMisses) * penaltyPerMiss +
-                            static_cast<uint64_t>(queueDelay);
+                            static_cast<uint64_t>(queueDelay) +
+                            static_cast<uint64_t>(tailSpike);
 
     totalDelayNs = std::min<uint64_t>(totalDelayNs, 1000000000ULL); // 1 second cap
 
@@ -483,7 +563,9 @@ Time DelayHooks::DelayIngress(uint32_t nodeId, uint32_t bytes, uint32_t seq)
                  << " misses=" << cacheMisses
                  << " penalty=" << penaltyPerMiss
                  << " queue=" << queueDelay
+                 << " ingressShape=" << ingressShapingNs
                  << " jitter=" << jitterNs
+                 << " tail=" << tailSpike
                  << " totalDelay=" << totalDelayNs << "ns");
 
     // Print summary every 1000 packets for visibility
