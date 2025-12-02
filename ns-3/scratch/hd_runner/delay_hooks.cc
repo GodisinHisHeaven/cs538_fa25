@@ -14,7 +14,6 @@
 
 #include "delay_hooks.h"
 #include "ns3/double.h"
-#include "ns3/exponential-random-variable.h"
 #include "ns3/log.h"
 #include "ns3/random-variable-stream.h"
 #include "ns3/simulator.h"
