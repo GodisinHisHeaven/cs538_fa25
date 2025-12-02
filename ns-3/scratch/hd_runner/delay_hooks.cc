@@ -108,7 +108,7 @@ static DelayModelConfig CreateRealisticConfig()
     config.queue.loadThreshold = 0.55;
     config.queue.queueGrowthFactor = 1.6;
 
-    config.ingress.baseIngressNs = 90000; // ~90us baseline host stack cost
+    config.ingress.baseIngressNs = 1000; // ~1us baseline host stack cost
     config.ingress.tailSlopeNs = 30000;   // add ~30us at nominal load
 
     config.tail.baseProbability = 0.001; // 0.1% background spikes
