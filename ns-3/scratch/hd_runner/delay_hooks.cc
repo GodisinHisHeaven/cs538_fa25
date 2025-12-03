@@ -104,13 +104,14 @@ static DelayModelConfig CreateRealisticConfig()
     config.penalty.loadThreshold = 0.7;
     config.penalty.highLoadMultiplier = 3.0;
 
-    config.queue.baseQueueNs = 8000; // ~8us soft queueing/base variance
-    config.queue.loadThreshold = 0.55;
-    config.queue.queueGrowthFactor = 1.6;
+    config.queue.baseQueueNs = 500; // ~0.5us base variance
+    config.queue.loadThreshold = 0.7;
+    config.queue.queueGrowthFactor = 0.5;
 
-    config.ingress.baseIngressNs = 1000; // ~1us baseline host stack cost
-    config.ingress.tailSlopeNs = 30000;   // add ~30us at nominal load
+    config.ingress.baseIngressNs = 0;     // disable ingress shaping to allow saturation
+    config.ingress.tailSlopeNs = 0;
 
+    // Re-enable heavy-tail spikes for rare scheduler-like stalls
     config.tail.baseProbability = 0.001; // 0.1% background spikes
     config.tail.loadSlope = 0.003;       // +0.3% per unit load
     config.tail.baseMeanNs = 60000;      // 60us spikes in baseline
@@ -432,7 +433,7 @@ void DelayHooks::Initialize(const std::string& configPath,
     g_cacheMissRv = CreateObject<UniformRandomVariable>();
     g_baseJitterRv = CreateObject<NormalRandomVariable>();
     g_baseJitterRv->SetAttribute("Mean", DoubleValue(0.0));
-    g_baseJitterRv->SetAttribute("Variance", DoubleValue(15000.0 * 15000.0));
+    g_baseJitterRv->SetAttribute("Variance", DoubleValue(50.0 * 50.0));
     g_tailTriggerRv = CreateObject<UniformRandomVariable>();
     g_tailSpikeRv = CreateObject<ExponentialRandomVariable>();
 
